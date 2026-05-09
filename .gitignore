@@ -1,0 +1,82 @@
+# ArduPilot & Gazebo Build Artifacts
+build/
+devel/
+*.o
+*.a
+*.so
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+
+# Simulation & SITL Logs
+logs/
+*.bin
+*.dat
+*.tlog
+*.tmp
+sim_vehicle_output.txt
+
+# Mission Planner & QGroundControl Files
+*.log
+*.bin
+*.mavlink
+qgc_logs/
+
+# Telemetry & Detection Output (Generated at Runtime)
+telemetry_*.json
+detections_*.json
+camera_*.log
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.kate-swp
+*~
+.DS_Store
+
+# Python Virtual Environments
+venv/
+env/
+ENV/
+.python-version
+
+# Screen Sessions
+.screenrc
+screenlog.*
+
+# Gazebo & Physics Caches
+.gazebo/
+gazebo_logs/
+*.cache
+
+# ArduPilot Specific
+ardupilot/build/
+ardupilot/.git
+*.elf
+core
+
+# Terrain & Map Data (optional - comment if needed)
+terrain/*.bin
+terrain/*.dat
+
+# GStreamer & Video Cache
+.gstreamer-1.0/
+*.mkv
+*.mp4
+
+# Temporary Files
+*.tmp
+temp/
+.lock
+
+# Linux Specific
+.Xauthority
+.bash_history
+
+# Keep important directories even if empty (create .gitkeep files in them)
+!logs/.gitkeep
+!terrain/.gitkeep
+!telemetry/.gitkeep
