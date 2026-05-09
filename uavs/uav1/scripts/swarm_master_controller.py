@@ -866,9 +866,9 @@ def main():
                     print("Bilinmeyen komut")
 
             except KeyboardInterrupt:
-                print("\n[SHUTDOWN] Interrupt signal - cleaning up...")
+                print("\n[SIGNAL] Mission stopped (type 'exit' to quit)")
                 master.stop_mission()
-                break
+                continue  # ← Input loop devam et, program kapmaaaa!
             except dronekit.APIException as exc:
                 print(f"[ERROR] Drone API error: {exc}")
                 print("[INFO] Check SITL/Gazebo connection status")
