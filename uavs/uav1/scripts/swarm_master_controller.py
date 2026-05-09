@@ -866,9 +866,12 @@ def main():
                     print("Bilinmeyen komut")
 
             except KeyboardInterrupt:
-                print("\n[SIGNAL] Mission stopped (type 'exit' to quit)")
+                print("\n[SIGNAL] Mission stopped - Formation hold starting...")
                 master.stop_mission()
-                continue  # ← Input loop devam et, program kapmaaaa!
+                # Background thread'de hold başlat (slave'ler master takip etsin)
+                hold_thread = threading.Thread(target=master.start_formation_hold, daemon=True)
+                hold_thread.start()
+                continue  # ← Input loop devam et!
             except dronekit.APIException as exc:
                 print(f"[ERROR] Drone API error: {exc}")
                 print("[INFO] Check SITL/Gazebo connection status")
