@@ -11,7 +11,9 @@ collections.MutableMapping = collections.abc.MutableMapping
 import argparse
 import enum
 import math
+import signal
 import sys
+import threading
 import time
 
 from dronekit import LocationGlobalRelative, VehicleMode, connect
@@ -295,7 +297,7 @@ class SwarmMaster:
         print("Formation mode started")
         start_time = time.time()
 
-        while True:
+        while self.mission_active:
             if duration is not None and (time.time() - start_time) > duration:
                 break
 
@@ -762,7 +764,16 @@ class SwarmMaster:
             self.enemy_vehicle.close()
 
 
+def signal_handler(sig, frame):
+    """Ctrl+C handler - graceful shutdown"""
+    print("\n[SIGNAL] Ctrl+C detected - stopping mission...")
+    # Signal handler will let KeyboardInterrupt be raised
+    raise KeyboardInterrupt()
+
 def main():
+    # Setup signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    
     parser = argparse.ArgumentParser(description="Swarm Master Controller")
     parser.add_argument("--master", default="127.0.0.1:15550", help="Master vehicle connection")
     parser.add_argument("--slave1", default="127.0.0.1:15560", help="Slave 1 connection")
@@ -812,14 +823,18 @@ def main():
                     master.takeoff_all(args.takeoff_altitude)
                 elif cmd == "mission start":
                     print("Mission starting...")
-                    master.start_mission(args.takeoff_altitude)
+                    # Background thread'de çalıştır (blocking olmaz)
+                    mission_thread = threading.Thread(target=master.start_mission, args=(args.takeoff_altitude,), daemon=True)
+                    mission_thread.start()
                 elif cmd == "mission stop":
                     master.stop_mission()
                 elif cmd == "mission status":
                     master.print_mission_status()
                 elif cmd == "enemy_track on":
                     print("Enemy tracking başlatılıyor...")
-                    master.track_enemy_slave2()
+                    # Background thread'de çalıştır (blocking olmaz)
+                    tracking_thread = threading.Thread(target=master.track_enemy_slave2, daemon=True)
+                    tracking_thread.start()
                 elif cmd == "enemy_track off":
                     print("Enemy tracking durdurulması istendi...")
                     master.enemy_tracking_active = False
