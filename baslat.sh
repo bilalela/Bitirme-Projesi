@@ -114,6 +114,11 @@ do
     SITL_TCP_PORT=$((5760 + (i * 10)))
     SITL_BRIDGE_PORT=$((5501 + (i * 10)))
     MAVPROXY_OUT_PORT=$((14550 + (i * 10)))
+    EXTRA_ENEMY_OUT_ARG=""
+    if [ "$SYSID" -eq 6 ]; then
+        ENEMY_TRACK_PORT=15610
+        EXTRA_ENEMY_OUT_ARG="--out 127.0.0.1:$ENEMY_TRACK_PORT"
+    fi
     CURRENT_PARAM="$CONFIG_PATH/$PARAM_FILE.param"
     UAV_DIR="$BASE_UAV_DIR/uav$SYSID"
     
@@ -127,6 +132,9 @@ do
     echo "UAV$SYSID başlatılıyor:"
     echo "  - SYSID: $SYSID"
     echo "  - Port: $PORT"
+    if [ "$SYSID" -eq 6 ]; then
+        echo "  - Enemy Track Port: $ENEMY_TRACK_PORT"
+    fi
     echo "  - Instance: $INSTANCE"
     echo "  - Param: $PARAM_FILE"
     echo "  - Dizin: $UAV_DIR"
@@ -143,7 +151,7 @@ do
           fi
           sleep 1
       done
-      mavproxy.py --retries 5 --out 127.0.0.1:$MAVPROXY_OUT_PORT --master tcp:127.0.0.1:$SITL_TCP_PORT --sitl 127.0.0.1:$SITL_BRIDGE_PORT --out 127.0.0.1:$PORT --console > '$UAV_DIR/mavproxy.log' 2>&1
+            mavproxy.py --retries 5 --out 127.0.0.1:$MAVPROXY_OUT_PORT --master tcp:127.0.0.1:$SITL_TCP_PORT --sitl 127.0.0.1:$SITL_BRIDGE_PORT --out 127.0.0.1:$PORT $EXTRA_ENEMY_OUT_ARG --console > '$UAV_DIR/mavproxy.log' 2>&1
       kill \$ARDUPLANE_PID 2>/dev/null || true
     "; then
         sleep 2

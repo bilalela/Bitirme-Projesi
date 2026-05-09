@@ -47,9 +47,10 @@ class MissionState(enum.Enum):
 
 
 class SwarmMaster:
-    def __init__(self, connection_string, vehicle_id=1):
+    def __init__(self, connection_string, vehicle_id=1, enemy_connection_string="127.0.0.1:15610"):
         self.connection_string = connection_string
         self.vehicle_id = vehicle_id
+        self.enemy_connection_string = enemy_connection_string
         self.vehicle = None
         self.slave_vehicles = {}
         self.enemy_vehicle = None  # Enemy UAV6
@@ -69,6 +70,7 @@ class SwarmMaster:
         # Enemy tracking
         self.enemy_position = None
         self.enemy_tracking_active = False
+        self.enemy_connecting = False
         self.last_enemy_update = 0
         # Mission state
         self.mission_state = MissionState.IDLE
@@ -387,6 +389,35 @@ class SwarmMaster:
         print(f"Missile fire command sent to vehicle {vehicle_id} hardpoint {hardpoint}")
         return True
 
+    def set_vehicle_speed(self, vehicle_id, airspeed_ms):
+        """Herhangi bir araç hızını anında ayarla (m/s)."""
+        vehicles_to_update = []
+        
+        if vehicle_id == "all" or vehicle_id == "1":
+            if self.vehicle:
+                vehicles_to_update.append(("Master (UAV1)", self.vehicle))
+        
+        if vehicle_id == "all" or vehicle_id in ["2", "3", "4", "5"]:
+            for slave_id in [2, 3, 4, 5]:
+                if self.slave_vehicles.get(slave_id):
+                    vehicles_to_update.append((f"Slave {slave_id}", self.slave_vehicles.get(slave_id)))
+        elif vehicle_id == "6" or (vehicle_id == "all" and self.enemy_vehicle):
+            if self.enemy_vehicle:
+                vehicles_to_update.append(("Enemy (UAV6)", self.enemy_vehicle))
+        
+        if not vehicles_to_update:
+            print(f"❌ Araç {vehicle_id} bulunamadı")
+            return False
+        
+        for name, vehicle in vehicles_to_update:
+            try:
+                vehicle.airspeed = float(airspeed_ms)
+                print(f"✅ {name} hızı {airspeed_ms} m/s olarak ayarlandı")
+            except Exception as exc:
+                print(f"❌ {name} hız ayarlaması başarısız: {exc}")
+        
+        return True
+
     def print_mission_status(self):
         """Detaylı mission durumu göster."""
         print("\n" + "="*70)
@@ -522,16 +553,27 @@ class SwarmMaster:
 
     def track_enemy_slave2(self):
         """Slave 2'yi enemy'nin 10m arkasında sürekli takip etmesini sağla."""
+        if self.enemy_tracking_active:
+            print("ℹ️ Enemy tracking zaten aktif")
+            return
+
+        if self.enemy_connecting:
+            print("ℹ️ Enemy bağlantısı zaten kuruluyor, lütfen bekleyin")
+            return
+
         # Connect to enemy if not already connected
         if not self.enemy_vehicle:
+            self.enemy_connecting = True
             print("🔗 Connecting to Enemy UAV (on-demand for tracking)...")
-            self.add_enemy("tcp:127.0.0.1:5810")  # Direct SITL TCP port
+            self.add_enemy(self.enemy_connection_string)
+            self.enemy_connecting = False
         
         if not self.enemy_vehicle or not self.slave_vehicles.get(2):
             print("❌ Enemy vehicle veya Slave 2 bağlı değil")
             return
         
         slave2 = self.slave_vehicles.get(2)
+        self._set_guided(slave2)
         print("🎯 Slave 2 enemy tracking başlatıldı (10m arkada tutulacak)")
         self.enemy_tracking_active = True
         
@@ -693,12 +735,10 @@ class SwarmMaster:
             print("[FORMATION] Skipping master: telemetry not ready")
             return
 
-        # 🎯 ENEMY TRACKING: Update enemy position continuously
+        # Enemy tracking aktifken yalnızca enemy telemetry güncelle.
+        # Slave 2 hedefi track_enemy_slave2() döngüsünde yönetilir.
         if self.enemy_vehicle and self.enemy_tracking_active:
             self._update_enemy_position()
-            if self.enemy_position:
-                # Assign rear guard tasks for slave 2 and 3
-                self._assign_rear_guard_tasks()
 
         master_location = self.vehicle.location.global_relative_frame
         
@@ -724,6 +764,9 @@ class SwarmMaster:
         # Update all slave positions relative to master
         for slave_id, slave in self.slave_vehicles.items():
             if slave is None:
+                continue
+            # Enemy tracking aktifken Slave 2 komutunu formation ile ezme.
+            if self.enemy_tracking_active and slave_id == 2:
                 continue
             if not self._has_valid_position(slave):
                 print(f"[FORMATION] Skipping Slave {slave_id}: telemetry not ready")
@@ -844,13 +887,12 @@ def main():
     parser.add_argument("--slave2", default="127.0.0.1:15570", help="Slave 2 connection")
     parser.add_argument("--slave3", default="127.0.0.1:15580", help="Slave 3 connection")
     parser.add_argument("--slave4", default="127.0.0.1:15590", help="Slave 4 connection")
-    # Prefer connecting directly to the SITL TCP port for the enemy to avoid MAVProxy port sharing
-    parser.add_argument("--enemy", default="tcp:127.0.0.1:5810", help="Enemy UAV connection (default: direct SITL TCP)")
+    parser.add_argument("--enemy", default="127.0.0.1:15610", help="Enemy UAV connection (default: dedicated MAVProxy out port)")
     parser.add_argument("--takeoff-altitude", type=float, default=50.0, help="Formation takeoff altitude")
     parser.add_argument("--formation-duration", type=float, help="Optional formation runtime in seconds")
     args = parser.parse_args()
 
-    master = SwarmMaster(args.master)
+    master = SwarmMaster(args.master, enemy_connection_string=args.enemy)
 
     try:
         master.connect()
@@ -873,6 +915,7 @@ def main():
         print("  mission status         - Detaylı görev durumunu göster")
         print("  enemy_track on         - Slave 2'yi enemy'nin 10m arkasında takip et")
         print("  enemy_track off        - Enemy tracking'i durdur")
+        print("  speed <id> <m/s>       - Araç hızını ayarla (id: 1-6 veya all)")
         print("  disarm                 - Tüm araçları disarm et")
         print("  status                 - Araç durumlarını göster")
         print("  fire <slave>           - Füze atış komutu gönder")
@@ -905,12 +948,29 @@ def main():
                     master.print_mission_status()
                 elif cmd == "enemy_track on":
                     print("Enemy tracking başlatılıyor...")
-                    # Background thread'de çalıştır (blocking olmaz)
-                    tracking_thread = threading.Thread(target=master.track_enemy_slave2, daemon=True)
-                    tracking_thread.start()
+                    if master.enemy_tracking_active or master.enemy_connecting:
+                        print("ℹ️ Enemy tracking zaten aktif veya bağlantı kuruluyor")
+                    else:
+                        # Background thread'de çalıştır (blocking olmaz)
+                        tracking_thread = threading.Thread(target=master.track_enemy_slave2, daemon=True)
+                        tracking_thread.start()
                 elif cmd == "enemy_track off":
                     print("Enemy tracking durdurulması istendi...")
                     master.enemy_tracking_active = False
+                elif cmd.startswith("speed"):
+                    parts = cmd.split()
+                    if len(parts) >= 3:
+                        try:
+                            vehicle_id = parts[1]
+                            airspeed = float(parts[2])
+                            master.set_vehicle_speed(vehicle_id, airspeed)
+                        except ValueError:
+                            print("❌ Hata: speed <id> <m/s> (örnek: speed 2 18 veya speed all 15)")
+                    else:
+                        print("❌ Kullanım: speed <id> <m/s>")
+                        print("   id: 1 (Master), 2-5 (Slaves), 6 (Enemy), veya all (tümü)")
+                        print("   Örnek: speed 2 18 (Slave 2'yi 18 m/s yap)")
+                        print("         speed all 15 (Tüm araçları 15 m/s yap)")
                 elif cmd == "disarm":
                     master.disarm_all()
                 elif cmd == "status":
