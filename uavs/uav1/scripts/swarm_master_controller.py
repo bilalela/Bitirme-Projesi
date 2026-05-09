@@ -746,12 +746,17 @@ class SwarmMaster:
             self.mission_active = False
 
     def stop_mission(self):
-        """Görev durdur ve eve dön."""
+        """Görev durdur (motor açık kalır, slave'ler master takip etmeye devam eder)."""
         print("Stopping mission")
         self.mission_active = False
-        self.mission_state = MissionState.RTB
-        self.disarm_all()
+        self.mission_state = MissionState.IDLE
+        # NOT: disarm_all() çağırma - slave'ler master'ı takip etmeye devam etsin
 
+
+    def start_formation_hold(self, duration=None):
+        """Slave'ler master'ı takip etmeye devam et (armed kalır)."""
+        print("Formation hold mode - slaves following master")
+        self.hold_formation(duration=duration, altitude=None)
 
     def close(self):
         """Bağlantıları kapat."""
@@ -801,11 +806,13 @@ def main():
         print("\nKomutlar:")
         print("  arm                    - Tüm araçları GUIDED + armed yap")
         print("  takeoff                - Tüm araçları belirtilen irtifaya kaldır")
+        print("  hold                   - Slave'ler master'ı takip etsin (armed kalır)")
         print("  mission start          - Swarm görevini başlat (formation → search → engage)")
-        print("  mission stop           - Görev durdur ve eve dön")
+        print("  mission stop           - Görev durdur (motor açık)")
         print("  mission status         - Detaylı görev durumunu göster")
         print("  enemy_track on         - Slave 2'yi enemy'nin 20m arkasında takip et")
         print("  enemy_track off        - Enemy tracking'i durdur")
+        print("  disarm                 - Tüm araçları disarm et")
         print("  status                 - Araç durumlarını göster")
         print("  fire <slave>           - Füze atış komutu gönder")
         print("  exit                   - Çık")
@@ -828,6 +835,11 @@ def main():
                     mission_thread.start()
                 elif cmd == "mission stop":
                     master.stop_mission()
+                elif cmd == "hold":
+                    print("Formation hold starting...")
+                    # Background thread'de çalıştır
+                    hold_thread = threading.Thread(target=master.start_formation_hold, daemon=True)
+                    hold_thread.start()
                 elif cmd == "mission status":
                     master.print_mission_status()
                 elif cmd == "enemy_track on":
@@ -838,6 +850,8 @@ def main():
                 elif cmd == "enemy_track off":
                     print("Enemy tracking durdurulması istendi...")
                     master.enemy_tracking_active = False
+                elif cmd == "disarm":
+                    master.disarm_all()
                 elif cmd == "status":
                     master.status()
                 elif cmd.startswith("fire"):
