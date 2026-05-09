@@ -52,10 +52,10 @@ class SwarmMaster:
         self.slave_vehicles = {}
         self.enemy_vehicle = None  # Enemy UAV6
         self.formation_offsets = {
-            2: (-1.5, -0.8),   # Çok yakın sol arka (echelon)
-            3: (-1.5, 0.8),    # Çok yakın sağ arka (echelon)
-            4: (-3.0, -0.8),   # Yakın arka sol (echelon)
-            5: (-3.0, 0.8),    # Yakın arka sağ (echelon)
+            2: (-4.0, -2.0),   # Sol arka (artırılmış mesafe)
+            3: (-4.0, 2.0),    # Sağ arka (artırılmış mesafe)
+            4: (-6.0, -2.0),   # Daha arka sol (artırılmış mesafe)
+            5: (-6.0, 2.0),    # Daha arka sağ (artırılmış mesafe)
         }
         # Task assignments for slaves
         self.slave_tasks = {
@@ -470,6 +470,71 @@ class SwarmMaster:
                 print(f"[ENEMY_TRACK] Slave {slave_id} → Enemy rear ({target_loc.lat:.6f}, {target_loc.lon:.6f}) alt={target_loc.alt:.1f}m")
                 slave.simple_goto(target_loc)
 
+    def track_enemy_slave2(self):
+        """Slave 2'yi enemy'nin 20m arkasında sürekli takip etmesini sağla."""
+        if not self.enemy_vehicle or not self.slave_vehicles.get(2):
+            print("❌ Enemy vehicle veya Slave 2 bağlı değil")
+            return
+        
+        slave2 = self.slave_vehicles.get(2)
+        print("🎯 Slave 2 enemy tracking başlatıldı (20m arkada tutulacak)")
+        self.enemy_tracking_active = True
+        
+        try:
+            tracking_count = 0
+            while self.enemy_tracking_active:
+                if not self._has_valid_position(self.enemy_vehicle) or not self._has_valid_position(slave2):
+                    time.sleep(1)
+                    continue
+                
+                # Enemy konumunu al
+                enemy_loc = self.enemy_vehicle.location.global_relative_frame
+                enemy_alt = enemy_loc.alt if enemy_loc.alt else 50
+                
+                # Slave 2'nin 20m arkasında takip etmesi için hedef konum
+                # Enemy'nin arkasında (-20m north)
+                target_loc = self.get_location_metres(
+                    LocationGlobalRelative(enemy_loc.lat, enemy_loc.lon, enemy_alt),
+                    -20,  # 20m behind
+                    0,    # Center (no left/right offset)
+                    enemy_alt
+                )
+                
+                # Slave 2'ye komut gönder
+                slave2.simple_goto(target_loc)
+                
+                tracking_count += 1
+                if tracking_count % 5 == 0:
+                    distance = self._calculate_distance(
+                        slave2.location.global_relative_frame.lat,
+                        slave2.location.global_relative_frame.lon,
+                        enemy_loc.lat,
+                        enemy_loc.lon
+                    )
+                    print(f"[SLAVE2_TRACK] Enemy: ({enemy_loc.lat:.6f}, {enemy_loc.lon:.6f}) | Slave2 distance: {distance:.1f}m")
+                
+                time.sleep(2)  # 2 saniyede bir güncelle
+        
+        except KeyboardInterrupt:
+            print("\n🛑 Slave 2 tracking durduruldu")
+        except Exception as exc:
+            print(f"❌ Tracking hatası: {exc}")
+        finally:
+            self.enemy_tracking_active = False
+
+    def _calculate_distance(self, lat1, lon1, lat2, lon2):
+        """İki GPS noktası arasındaki mesafeyi metre cinsinden hesapla (Haversine)."""
+        earth_radius = 6378137.0
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
+        delta_lat = math.radians(lat2 - lat1)
+        delta_lon = math.radians(lon2 - lon1)
+        
+        a = math.sin(delta_lat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        distance = earth_radius * c
+        return distance
+
     def _assign_tasks(self):
         """Slave'lere görev ata (only once per ENGAGE state)."""
         if not self.slave_vehicles or self.mission_state != MissionState.ENGAGE:
@@ -728,6 +793,8 @@ def main():
         print("  mission start          - Swarm görevini başlat (formation → search → engage)")
         print("  mission stop           - Görev durdur ve eve dön")
         print("  mission status         - Detaylı görev durumunu göster")
+        print("  enemy_track on         - Slave 2'yi enemy'nin 20m arkasında takip et")
+        print("  enemy_track off        - Enemy tracking'i durdur")
         print("  status                 - Araç durumlarını göster")
         print("  fire <slave>           - Füze atış komutu gönder")
         print("  exit                   - Çık")
@@ -750,6 +817,12 @@ def main():
                     master.stop_mission()
                 elif cmd == "mission status":
                     master.print_mission_status()
+                elif cmd == "enemy_track on":
+                    print("Enemy tracking başlatılıyor...")
+                    master.track_enemy_slave2()
+                elif cmd == "enemy_track off":
+                    print("Enemy tracking durdurulması istendi...")
+                    master.enemy_tracking_active = False
                 elif cmd == "status":
                     master.status()
                 elif cmd.startswith("fire"):
