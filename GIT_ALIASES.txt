@@ -1,0 +1,47 @@
+# 🚀 GIT QUICK ALIASES
+
+# Status & Log
+alias gs='git status'                              # Quick status
+alias ga='git add -A'                              # Add all changes
+alias gc='git commit -m'                           # Commit
+alias gp='git push'                                # Push to remote
+alias gl='git log --oneline -n 10'                # Last 10 commits
+alias gll='git log --graph --oneline --all'       # Graph view
+
+# Diff & Browse
+alias gd='git diff'                                # Unstaged changes
+alias gdc='git diff --cached'                      # Staged changes
+alias gb='git branch -a'                           # All branches
+alias gco='git checkout'                           # Checkout branch
+
+# Undo & Cleanup
+alias gundo='git reset --soft HEAD~1'              # Undo (keep files)
+alias greset='git reset --hard HEAD'               # Reset hard (DANGER!)
+alias gstash='git stash'                           # Stash changes
+alias gpop='git stash pop'                         # Restore stashed
+alias gclean='git clean -fd'                       # Clean untracked files
+
+# Functions (one-liners)
+gcp() {
+    git add -A && git commit -m "$1" && git push
+}
+
+gfeat() {
+    git checkout -b "feature/$1"
+}
+
+ginfo() {
+    echo "Branch: $(git rev-parse --abbrev-ref HEAD)"
+    echo "Remote: $(git config --get remote.origin.url)"
+    echo "Last: $(git log -1 --pretty=format:'%s')"
+}
+
+# Quick Status
+gstatus() {
+    git status
+    echo ""
+    echo "Last 5 commits:"
+    git log --oneline -n 5
+}
+
+# Copy this into ~/.bashrc or ~/.zshrc
