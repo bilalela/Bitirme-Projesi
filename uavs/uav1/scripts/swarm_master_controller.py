@@ -309,9 +309,10 @@ class SwarmMaster:
         return master_groundspeed if master_groundspeed > 1.0 else 15.0
 
     def _set_slave_speed_for_formation(self, slave, target_location):
-        """Hedef ofsete uzaklığa göre slave hızını ayarla.
-
-        Uzaksa hızlanır, hedefe yaklaşınca master ile aynı hıza iner.
+        """Hedef ofsete uzaklığa göre slave hızını dinamik ayarla.
+        
+        Slavlar master'ın hızını takip eder, ama offset fazlaysa hızlanırlar.
+        Amaç: sabit mesafe + sabit irtifa farkı korumak.
         """
         if slave is None or target_location is None or not self._has_valid_position(slave):
             return
@@ -323,14 +324,25 @@ class SwarmMaster:
             target_location.lat,
             target_location.lon,
         )
+        
+        # Irtifa farkını hesapla
+        altitude_diff = abs(slave_loc.alt - target_location.alt) if target_location.alt else 0
 
         master_speed = self._get_master_reference_speed()
-        if distance_to_target > 25.0:
-            commanded_speed = min(master_speed + 6.0, 24.0)
-        elif distance_to_target > 10.0:
-            commanded_speed = min(master_speed + 3.0, 22.0)
+        
+        # Dinamik hız: uzaklık ve irtifa farkına bağlı olarak master hızından sapma
+        if distance_to_target > 30.0 or altitude_diff > 15.0:
+            # Çok uzak - agresif şekilde yaklaş
+            commanded_speed = min(master_speed + 8.0, 25.0)
+        elif distance_to_target > 20.0 or altitude_diff > 10.0:
+            # Oldukça uzak - hızlan
+            commanded_speed = min(master_speed + 5.0, 23.0)
+        elif distance_to_target > 10.0 or altitude_diff > 5.0:
+            # Biraz uzak - hafif hızlan
+            commanded_speed = min(master_speed + 2.5, 21.0)
         else:
-            commanded_speed = max(master_speed, 12.0)
+            # Yakın - master ile eşitle
+            commanded_speed = master_speed
 
         try:
             slave.airspeed = commanded_speed
@@ -552,7 +564,13 @@ class SwarmMaster:
                 slave.simple_goto(target_loc)
 
     def track_enemy_slave2(self):
-        """Slave 2'yi enemy'nin 10m arkasında sürekli takip etmesini sağla."""
+        """Slave 2'yi enemy'nin TAM 10m arkasında dinamik hızla takip etmesini sağla.
+        
+        Slave2 aktif olarak mesafeyi monitor eder ve hızını dinamik ayarlar:
+        - Enemy'ye > 10.5m uzaksa hızlan (yaklaş)
+        - Enemy'ye < 9.5m yakınsa yavaşla (uzaklaş)
+        - 9.5-10.5m arasında ise sabit tut (maintain)
+        """
         if self.enemy_tracking_active:
             print("ℹ️ Enemy tracking zaten aktif")
             return
@@ -574,30 +592,55 @@ class SwarmMaster:
         
         slave2 = self.slave_vehicles.get(2)
         self._set_guided(slave2)
-        print("🎯 Slave 2 enemy tracking başlatıldı (10m arkada tutulacak)")
+        print("🎯 Slave 2 enemy tracking başlatıldı (10m arkada sabit tutulacak, dinamik hız)")
         self.enemy_tracking_active = True
         
         try:
             tracking_count = 0
+            current_speed = 18.0  # Başlangıç hızı
+            
             while self.enemy_tracking_active:
                 if not self._has_valid_position(self.enemy_vehicle) or not self._has_valid_position(slave2):
                     time.sleep(1)
                     continue
                 
-                # Enemy konumunu al
+                # Enemy ve Slave2 konumlarını al
                 enemy_loc = self.enemy_vehicle.location.global_relative_frame
+                slave2_loc = slave2.location.global_relative_frame
                 enemy_alt = enemy_loc.alt if enemy_loc.alt else 50
 
+                # Enemy'ye anlık mesafeyi hesapla
+                current_distance = self._calculate_distance(
+                    slave2_loc.lat,
+                    slave2_loc.lon,
+                    enemy_loc.lat,
+                    enemy_loc.lon
+                )
+
+                # Dinamik hız kontrolü: mesafeye bağlı olarak hızı ayarla
+                # Hedef: 10m ± 1m (9.5-10.5m band)
+                if current_distance > 10.5:
+                    # Çok uzak - hızlan ve yaklaş
+                    # Uzaklık arttıkça daha agresif hızlan
+                    distance_error = current_distance - 10.0
+                    current_speed = min(18.0 + (distance_error * 0.8), 24.0)
+                elif current_distance < 9.5:
+                    # Çok yakın - yavaşla ve uzaklaş
+                    distance_error = 10.0 - current_distance
+                    current_speed = max(12.0, 18.0 - (distance_error * 0.8))
+                else:
+                    # Band içinde - sabit tut (hysteresis)
+                    pass
+
                 try:
-                    slave2.airspeed = 18.0
+                    slave2.airspeed = current_speed
                 except Exception:
                     pass
                 
-                # Slave 2'nin 10m arkasında takip etmesi için hedef konum
-                # Enemy'nin arkasında (-10m north)
+                # Enemy'nin 10m arkasını hedef konum olarak belirle
                 target_loc = self.get_location_metres(
                     LocationGlobalRelative(enemy_loc.lat, enemy_loc.lon, enemy_alt),
-                    -10,  # 10m behind
+                    -10,  # 10m behind (south)
                     0,    # Center (no left/right offset)
                     enemy_alt
                 )
@@ -607,13 +650,8 @@ class SwarmMaster:
                 
                 tracking_count += 1
                 if tracking_count % 5 == 0:
-                    distance = self._calculate_distance(
-                        slave2.location.global_relative_frame.lat,
-                        slave2.location.global_relative_frame.lon,
-                        enemy_loc.lat,
-                        enemy_loc.lon
-                    )
-                    print(f"[SLAVE2_TRACK] Enemy: ({enemy_loc.lat:.6f}, {enemy_loc.lon:.6f}) | Slave2 distance: {distance:.1f}m")
+                    print(f"[SLAVE2_TRACK] Enemy: ({enemy_loc.lat:.6f}, {enemy_loc.lon:.6f}) | "
+                          f"Slave2 distance: {current_distance:.1f}m | Speed: {current_speed:.1f} m/s")
                 
                 time.sleep(2)  # 2 saniyede bir güncelle
         
