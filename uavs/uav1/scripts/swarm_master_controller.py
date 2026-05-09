@@ -564,12 +564,12 @@ class SwarmMaster:
                 slave.simple_goto(target_loc)
 
     def track_enemy_slave2(self):
-        """Slave 2'yi enemy'nin TAM 10m arkasında dinamik hızla takip etmesini sağla.
+        """Slave 2'yi enemy'nin TAM 5m arkasında dinamik hızla takip etmesini sağla.
         
         Slave2 aktif olarak mesafeyi monitor eder ve hızını dinamik ayarlar:
-        - Enemy'ye > 10.5m uzaksa hızlan (yaklaş)
-        - Enemy'ye < 9.5m yakınsa yavaşla (uzaklaş)
-        - 9.5-10.5m arasında ise sabit tut (maintain)
+        - Enemy'ye > 5.5m uzaksa hızlan (yaklaş)
+        - Enemy'ye < 4.5m yakınsa yavaşla (uzaklaş)
+        - 4.5-5.5m arasında ise sabit tut (maintain)
         """
         if self.enemy_tracking_active:
             print("ℹ️ Enemy tracking zaten aktif")
@@ -592,7 +592,7 @@ class SwarmMaster:
         
         slave2 = self.slave_vehicles.get(2)
         self._set_guided(slave2)
-        print("🎯 Slave 2 enemy tracking başlatıldı (10m arkada sabit tutulacak, dinamik hız)")
+        print("🎯 Slave 2 enemy tracking başlatıldı (5m arkada sabit tutulacak, dinamik hız)")
         self.enemy_tracking_active = True
         
         try:
@@ -618,16 +618,16 @@ class SwarmMaster:
                 )
 
                 # Dinamik hız kontrolü: mesafeye bağlı olarak hızı ayarla
-                # Hedef: 10m ± 1m (9.5-10.5m band)
-                if current_distance > 10.5:
+                # Hedef: 5m ± 1m (4.5-5.5m band)
+                if current_distance > 5.5:
                     # Çok uzak - hızlan ve yaklaş
                     # Uzaklık arttıkça daha agresif hızlan
-                    distance_error = current_distance - 10.0
-                    current_speed = min(18.0 + (distance_error * 0.8), 24.0)
-                elif current_distance < 9.5:
+                    distance_error = current_distance - 5.0
+                    current_speed = min(18.0 + (distance_error * 1.5), 24.0)
+                elif current_distance < 4.5:
                     # Çok yakın - yavaşla ve uzaklaş
-                    distance_error = 10.0 - current_distance
-                    current_speed = max(12.0, 18.0 - (distance_error * 0.8))
+                    distance_error = 5.0 - current_distance
+                    current_speed = max(12.0, 18.0 - (distance_error * 1.5))
                 else:
                     # Band içinde - sabit tut (hysteresis)
                     pass
@@ -637,11 +637,11 @@ class SwarmMaster:
                 except Exception:
                     pass
                 
-                # Enemy'nin 10m arkasını hedef konum olarak belirle
+                # Enemy'nin 5m arkasını hedef konum olarak belirle
                 target_loc = self.get_location_metres(
                     LocationGlobalRelative(enemy_loc.lat, enemy_loc.lon, enemy_alt),
-                    -10,  # 10m behind (south)
-                    0,    # Center (no left/right offset)
+                    -5,  # 5m behind (south)
+                    0,   # Center (no left/right offset)
                     enemy_alt
                 )
                 
