@@ -858,7 +858,8 @@ def main():
         master.add_slave(3, args.slave2)
         master.add_slave(4, args.slave3)
         master.add_slave(5, args.slave4)
-        master.add_enemy(args.enemy)  # Connect to enemy UAV
+        # NOTE: Enemy UAV6 is NOT a slave and NOT automatically connected.
+        # Enemy will be connected on-demand when enemy_track on command is invoked.
 
         print("\n" + "="*70)
         print("👑 SWARM MASTER CONTROLLER AKTIF")
