@@ -54,10 +54,10 @@ class SwarmMaster:
         self.slave_vehicles = {}
         self.enemy_vehicle = None  # Enemy UAV6
         self.formation_offsets = {
-            2: (-15.0, -9.0),  # Sol arka, master'dan 15m geride
-            3: (-15.0, -3.0),  # Sol-orta, master'dan 15m geride
-            4: (-15.0, 3.0),   # Sağ-orta, master'dan 15m geride
-            5: (-15.0, 9.0),   # Sağ arka, master'dan 15m geride
+            2: (-30.0, 0.0),   # Master'dan 30m arkada (ilk slave)
+            3: (-45.0, 0.0),   # Slave 2'nin 15m arkasında
+            4: (-60.0, 0.0),   # Slave 3'ün 15m arkasında
+            5: (-75.0, 0.0),   # Slave 4'ün 15m arkasında
         }
         # Task assignments for slaves
         self.slave_tasks = {
@@ -76,6 +76,7 @@ class SwarmMaster:
         self.mission_active = False
         self.search_altitude = 50.0
         self.search_radius = 100.0
+        self.auto_target_detection = False
         # Target detector
         self.target_detector = TargetDetector(vehicle_id=3)
         self._formation_takeoff_mode = False
@@ -230,7 +231,8 @@ class SwarmMaster:
         self.add_slave(3, "127.0.0.1:15570")
         self.add_slave(4, "127.0.0.1:15580")
         self.add_slave(5, "127.0.0.1:15590")
-        self.add_enemy("127.0.0.1:15600")  # Enemy UAV6
+        # NOTE: Enemy UAV6 is NOT a slave - it is NOT automatically connected.
+        # Connect enemy only when enemy_track command is invoked.
 
     def arm_all(self):
         """Tüm araçları GUIDED + armed durumuna al."""
@@ -288,6 +290,51 @@ class SwarmMaster:
     def _get_slave_offset(self, slave_id):
         return self.formation_offsets.get(slave_id, (-25.0, 0.0))
 
+    def _get_master_reference_speed(self):
+        """Master hız referansını al (airspeed öncelikli, sonra groundspeed)."""
+        if self.vehicle is None:
+            return 15.0
+        try:
+            master_airspeed = float(self.vehicle.airspeed or 0.0)
+        except Exception:
+            master_airspeed = 0.0
+        if master_airspeed > 1.0:
+            return master_airspeed
+        try:
+            master_groundspeed = float(self.vehicle.groundspeed or 0.0)
+        except Exception:
+            master_groundspeed = 0.0
+        return master_groundspeed if master_groundspeed > 1.0 else 15.0
+
+    def _set_slave_speed_for_formation(self, slave, target_location):
+        """Hedef ofsete uzaklığa göre slave hızını ayarla.
+
+        Uzaksa hızlanır, hedefe yaklaşınca master ile aynı hıza iner.
+        """
+        if slave is None or target_location is None or not self._has_valid_position(slave):
+            return
+
+        slave_loc = slave.location.global_relative_frame
+        distance_to_target = self._calculate_distance(
+            slave_loc.lat,
+            slave_loc.lon,
+            target_location.lat,
+            target_location.lon,
+        )
+
+        master_speed = self._get_master_reference_speed()
+        if distance_to_target > 25.0:
+            commanded_speed = min(master_speed + 6.0, 24.0)
+        elif distance_to_target > 10.0:
+            commanded_speed = min(master_speed + 3.0, 22.0)
+        else:
+            commanded_speed = max(master_speed, 12.0)
+
+        try:
+            slave.airspeed = commanded_speed
+        except Exception:
+            pass
+
     def hold_formation(self, duration=None, update_interval=2.0, altitude=None):
         """Master konumuna göre sabit formation sürdür."""
         if self.vehicle is None:
@@ -314,6 +361,7 @@ class SwarmMaster:
                     east_offset,
                     current_altitude,
                 )
+                self._set_slave_speed_for_formation(slave, target_location)
                 slave.simple_goto(target_location)
 
             print(
@@ -474,6 +522,11 @@ class SwarmMaster:
 
     def track_enemy_slave2(self):
         """Slave 2'yi enemy'nin 10m arkasında sürekli takip etmesini sağla."""
+        # Connect to enemy if not already connected
+        if not self.enemy_vehicle:
+            print("🔗 Connecting to Enemy UAV (on-demand for tracking)...")
+            self.add_enemy("tcp:127.0.0.1:5810")  # Direct SITL TCP port
+        
         if not self.enemy_vehicle or not self.slave_vehicles.get(2):
             print("❌ Enemy vehicle veya Slave 2 bağlı değil")
             return
@@ -617,7 +670,7 @@ class SwarmMaster:
 
         elif self.mission_state == MissionState.FORMATION:
             # Hedef arayı başlat
-            detected = self._detect_targets()
+            detected = self._detect_targets() if self.auto_target_detection else None
             if detected:
                 self.target_data = detected
                 print(f"[STATE] FORMATION → SEARCH (target detected at {detected['lat']:.6f}, {detected['lon']:.6f})")
@@ -682,6 +735,7 @@ class SwarmMaster:
                 east_offset,
                 altitude,
             )
+            self._set_slave_speed_for_formation(slave, target_location)
             slave.simple_goto(target_location)
 
     def start_mission(self, altitude=None):
@@ -790,7 +844,8 @@ def main():
     parser.add_argument("--slave2", default="127.0.0.1:15570", help="Slave 2 connection")
     parser.add_argument("--slave3", default="127.0.0.1:15580", help="Slave 3 connection")
     parser.add_argument("--slave4", default="127.0.0.1:15590", help="Slave 4 connection")
-    parser.add_argument("--enemy", default="127.0.0.1:15600", help="Enemy UAV connection")
+    # Prefer connecting directly to the SITL TCP port for the enemy to avoid MAVProxy port sharing
+    parser.add_argument("--enemy", default="tcp:127.0.0.1:5810", help="Enemy UAV connection (default: direct SITL TCP)")
     parser.add_argument("--takeoff-altitude", type=float, default=50.0, help="Formation takeoff altitude")
     parser.add_argument("--formation-duration", type=float, help="Optional formation runtime in seconds")
     args = parser.parse_args()

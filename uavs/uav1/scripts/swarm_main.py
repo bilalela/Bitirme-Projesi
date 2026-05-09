@@ -23,7 +23,8 @@ def main():
     parser.add_argument("--slave2", default="udp:127.0.0.1:15570", help="Slave 2 connection")
     parser.add_argument("--slave3", default="udp:127.0.0.1:15580", help="Slave 3 connection")
     parser.add_argument("--slave4", default="udp:127.0.0.1:15590", help="Slave 4 connection")
-    parser.add_argument("--enemy", default="udp:127.0.0.1:15600", help="Enemy UAV connection")
+    # Connect to enemy directly to SITL TCP port to avoid MAVProxy forwarding conflicts
+    parser.add_argument("--enemy", default="tcp:127.0.0.1:5810", help="Enemy UAV connection (default: direct SITL TCP)")
     parser.add_argument("--takeoff-altitude", type=float, default=50.0, help="Formation takeoff altitude")
     args = parser.parse_args()
 
@@ -35,7 +36,8 @@ def main():
         master.add_slave(3, args.slave2)
         master.add_slave(4, args.slave3)
         master.add_slave(5, args.slave4)
-        master.add_enemy(args.enemy)
+        # NOTE: Enemy UAV6 is NOT a slave and NOT automatically connected.
+        # Enemy will be connected on-demand when enemy tracking is started.
 
         print("\n" + "="*70)
         print("👑 SWARM MASTER CONTROLLER AKTIF (Modüler Sistem)")
