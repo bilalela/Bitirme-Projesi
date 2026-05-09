@@ -40,27 +40,29 @@ Simülasyon çalışırken **QGroundControl** ile bağlan:
 2. Sol üstte "+" butonuna tıkla (Add Connection)
 3. Bağlantı Ayarları:
    - Protocol: UDP
-   - Listening Port: 15550  (Master UAV için)
+  - Listening Port: 14550  (Master UAV için MAVProxy out port)
 4. "Connect" butonuna tıkla
 ```
 
 **Diğer UAV'lere bağlanmak için:**
-- UAV2: Port 15560
-- UAV3: Port 15570
-- UAV4: Port 15580
+- UAV2: Port 14560
+- UAV3: Port 14570
+- UAV4: Port 14580
+- UAV5: Port 14590
+- UAV6: Port 14600
 
 ---
 
 ## 📊 Sistem Portu Yapısı
 
-| UAV | SYSID | SITL Port | QGC Port | Kamera |
-|-----|-------|-----------|----------|--------|
-| UAV1 (Master) | 1 | 15550 | 15550 | ✅ Aktif |
-| UAV2 (Slave) | 2 | 15560 | 15560 | ✅ Aktif |
-| UAV3 (Slave) | 3 | 15570 | 15570 | ✅ Aktif |
-| UAV4 (Slave) | 4 | 15580 | 15580 | ✅ Aktif |
-| UAV5 (Slave) | 5 | 15590 | 15590 | ✅ Aktif |
-| UAV6 (Future Enemy) | 6 | 15600 | 15600 | ✅ Aktif |
+| UAV | SYSID | DroneKit / Controller Port | QGC MAVProxy Out Port | Kamera |
+|-----|-------|----------------------------|------------------------|--------|
+| UAV1 (Master) | 1 | 15550 | 14550 | ✅ Aktif |
+| UAV2 (Slave) | 2 | 15560 | 14560 | ✅ Aktif |
+| UAV3 (Slave) | 3 | 15570 | 14570 | ✅ Aktif |
+| UAV4 (Slave) | 4 | 15580 | 14580 | ✅ Aktif |
+| UAV5 (Slave) | 5 | 15590 | 14590 | ✅ Aktif |
+| UAV6 (Future Enemy) | 6 | 15600 | 14600 | ✅ Aktif |
 
 ---
 
@@ -101,7 +103,7 @@ gz sim -v4 -r vtail_runway_planes.sdf
 cd ~/uavs/uav1
 sim_vehicle.py -v ArduPlane -f plane --model JSON \
   --add-param-file=$HOME/SITL_Models/Gazebo/config/uav0.param \
-  --out=0.0.0.0:15550 --out=127.0.0.1:15550 --out=127.0.0.1:16550 \
+  --out=0.0.0.0:15550 --out=127.0.0.1:14550 \
   --console -I0 --sysid 1
 ```
 

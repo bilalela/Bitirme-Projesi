@@ -101,7 +101,7 @@ Bu komut şu özellikler ile çalışır:
 
 ### 2. QGroundControl Bağlan
 ```
-Main Vehicle Bağlantısı: 127.0.0.1:15550 (Master - UAV1)
+Main Vehicle QGC Bağlantısı: UDP 127.0.0.1:14550 (Master - UAV1 MAVProxy out)
 ```
 
 Terminal Tab'ları:

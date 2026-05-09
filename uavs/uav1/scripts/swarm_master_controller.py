@@ -54,10 +54,10 @@ class SwarmMaster:
         self.slave_vehicles = {}
         self.enemy_vehicle = None  # Enemy UAV6
         self.formation_offsets = {
-            2: (-4.0, -2.0),   # Sol arka (artırılmış mesafe)
-            3: (-4.0, 2.0),    # Sağ arka (artırılmış mesafe)
-            4: (-6.0, -2.0),   # Daha arka sol (artırılmış mesafe)
-            5: (-6.0, 2.0),    # Daha arka sağ (artırılmış mesafe)
+            2: (-15.0, -9.0),  # Sol arka, master'dan 15m geride
+            3: (-15.0, -3.0),  # Sol-orta, master'dan 15m geride
+            4: (-15.0, 3.0),   # Sağ-orta, master'dan 15m geride
+            5: (-15.0, 9.0),   # Sağ arka, master'dan 15m geride
         }
         # Task assignments for slaves
         self.slave_tasks = {
@@ -441,7 +441,7 @@ class SwarmMaster:
             return False
 
     def _assign_rear_guard_tasks(self):
-        """Slave 2 ve 3'e enemy'nin 20m arkasına gitme görevini ata."""
+        """Slave 2 ve 3'e enemy'nin 10m arkasına gitme görevini ata."""
         if not self.enemy_position or not self.slave_vehicles:
             return
         
@@ -449,18 +449,18 @@ class SwarmMaster:
         enemy_lon = self.enemy_position['lon']
         enemy_alt = self.enemy_position.get('alt', 50)
         
-        # Enemy'nin 20m arkasını hesapla (south direction)
-        # 20 metre south = -20 north offset
+        # Enemy'nin 10m arkasını hesapla (south direction)
+        # 10 metre south = -10 north offset
         rear_left_loc = self.get_location_metres(
             LocationGlobalRelative(enemy_lat, enemy_lon, enemy_alt),
-            -20,  # 20m behind (south)
-            -8,   # 8m west (left)
+            -10,  # 10m behind (south)
+            -4,   # 4m west (left)
             enemy_alt
         )
         rear_right_loc = self.get_location_metres(
             LocationGlobalRelative(enemy_lat, enemy_lon, enemy_alt),
-            -20,  # 20m behind (south)
-            8,    # 8m east (right)
+            -10,  # 10m behind (south)
+            4,    # 4m east (right)
             enemy_alt
         )
         
@@ -473,13 +473,13 @@ class SwarmMaster:
                 slave.simple_goto(target_loc)
 
     def track_enemy_slave2(self):
-        """Slave 2'yi enemy'nin 20m arkasında sürekli takip etmesini sağla."""
+        """Slave 2'yi enemy'nin 10m arkasında sürekli takip etmesini sağla."""
         if not self.enemy_vehicle or not self.slave_vehicles.get(2):
             print("❌ Enemy vehicle veya Slave 2 bağlı değil")
             return
         
         slave2 = self.slave_vehicles.get(2)
-        print("🎯 Slave 2 enemy tracking başlatıldı (20m arkada tutulacak)")
+        print("🎯 Slave 2 enemy tracking başlatıldı (10m arkada tutulacak)")
         self.enemy_tracking_active = True
         
         try:
@@ -492,12 +492,17 @@ class SwarmMaster:
                 # Enemy konumunu al
                 enemy_loc = self.enemy_vehicle.location.global_relative_frame
                 enemy_alt = enemy_loc.alt if enemy_loc.alt else 50
+
+                try:
+                    slave2.airspeed = 18.0
+                except Exception:
+                    pass
                 
-                # Slave 2'nin 20m arkasında takip etmesi için hedef konum
-                # Enemy'nin arkasında (-20m north)
+                # Slave 2'nin 10m arkasında takip etmesi için hedef konum
+                # Enemy'nin arkasında (-10m north)
                 target_loc = self.get_location_metres(
                     LocationGlobalRelative(enemy_loc.lat, enemy_loc.lon, enemy_alt),
-                    -20,  # 20m behind
+                    -10,  # 10m behind
                     0,    # Center (no left/right offset)
                     enemy_alt
                 )
@@ -810,7 +815,7 @@ def main():
         print("  mission start          - Swarm görevini başlat (formation → search → engage)")
         print("  mission stop           - Görev durdur (motor açık)")
         print("  mission status         - Detaylı görev durumunu göster")
-        print("  enemy_track on         - Slave 2'yi enemy'nin 20m arkasında takip et")
+        print("  enemy_track on         - Slave 2'yi enemy'nin 10m arkasında takip et")
         print("  enemy_track off        - Enemy tracking'i durdur")
         print("  disarm                 - Tüm araçları disarm et")
         print("  status                 - Araç durumlarını göster")
