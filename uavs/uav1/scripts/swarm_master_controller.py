@@ -770,9 +770,9 @@ class SwarmMaster:
 
 
 def signal_handler(sig, frame):
-    """Ctrl+C handler - graceful shutdown"""
-    print("\n[SIGNAL] Ctrl+C detected - stopping mission...")
-    # Signal handler will let KeyboardInterrupt be raised
+    """Ctrl+C handler - return to prompt without stopping background missions."""
+    print("\n[SIGNAL] Ctrl+C detected - returning to command prompt...")
+    # Let the input loop catch KeyboardInterrupt and continue.
     raise KeyboardInterrupt()
 
 def main():
@@ -866,12 +866,8 @@ def main():
                     print("Bilinmeyen komut")
 
             except KeyboardInterrupt:
-                print("\n[SIGNAL] Mission stopped - Formation hold starting...")
-                master.stop_mission()
-                # Background thread'de hold başlat (slave'ler master takip etsin)
-                hold_thread = threading.Thread(target=master.start_formation_hold, daemon=True)
-                hold_thread.start()
-                continue  # ← Input loop devam et!
+                print("\n[SIGNAL] Prompt ready - mission continues in background")
+                continue
             except dronekit.APIException as exc:
                 print(f"[ERROR] Drone API error: {exc}")
                 print("[INFO] Check SITL/Gazebo connection status")
