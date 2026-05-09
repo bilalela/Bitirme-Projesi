@@ -15,21 +15,64 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
+
+import cv2
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+VISION_DIR = PROJECT_ROOT / "Goruntu_isleme"
+if str(VISION_DIR) not in sys.path:
+    sys.path.insert(0, str(VISION_DIR))
+
+from object_detector import SharedYOLODetector
 
 from dronekit import LocationGlobalRelative, VehicleMode, connect
 import dronekit
 
 
 class TargetDetector:
-    """Basit hedef dedektörü (placeholder)."""
-    def __init__(self, vehicle_id=3):
+    """Shared YOLO tabanlı hedef dedektörü."""
+
+    def __init__(self, vehicle_id=3, camera_source="0"):
         self.vehicle_id = vehicle_id
+        self.camera_source = camera_source
         self.targets = []
+        self.detector = SharedYOLODetector()
+        self.capture = None
+
+    @staticmethod
+    def _resolve_camera_source(source):
+        try:
+            return int(source)
+        except (TypeError, ValueError):
+            return source
+
+    def _ensure_capture(self):
+        if self.capture is None:
+            source = self._resolve_camera_source(self.camera_source)
+            self.capture = cv2.VideoCapture(source)
+        return self.capture is not None and self.capture.isOpened()
 
     def detect_in_frame(self, frame):
-        """Frame'de hedef tespiti (placeholder)."""
-        # Gerçek uygulamada OpenCV ile renk tespiti yapılacak
-        return None
+        """Frame'de hedef tespiti yap."""
+        annotated_frame, detections = self.detector.annotate(frame)
+        return annotated_frame, detections
+
+    def detect_from_source(self):
+        """Kamera kaynağından bir frame oku ve tespit yap."""
+        if not self._ensure_capture():
+            return None, []
+
+        ok, frame = self.capture.read()
+        if not ok:
+            return None, []
+
+        return self.detect_in_frame(frame)
+
+    def close(self):
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
 
     def get_latest_target(self):
         """Son tespit edilen hedefi döndür."""
@@ -47,10 +90,11 @@ class MissionState(enum.Enum):
 
 
 class SwarmMaster:
-    def __init__(self, connection_string, vehicle_id=1, enemy_connection_string="127.0.0.1:15610"):
+    def __init__(self, connection_string, vehicle_id=1, enemy_connection_string="127.0.0.1:15610", target_camera_source="0"):
         self.connection_string = connection_string
         self.vehicle_id = vehicle_id
         self.enemy_connection_string = enemy_connection_string
+        self.target_camera_source = target_camera_source
         self.vehicle = None
         self.slave_vehicles = {}
         self.enemy_vehicle = None  # Enemy UAV6
@@ -78,9 +122,9 @@ class SwarmMaster:
         self.mission_active = False
         self.search_altitude = 50.0
         self.search_radius = 100.0
-        self.auto_target_detection = False
+        self.auto_target_detection = True
         # Target detector
-        self.target_detector = TargetDetector(vehicle_id=3)
+        self.target_detector = TargetDetector(vehicle_id=3, camera_source=target_camera_source)
         self._formation_takeoff_mode = False
         self._tasks_assigned = False  # Guard flag to prevent infinite task assignment
 
@@ -476,11 +520,23 @@ class SwarmMaster:
         elif self.mission_state == MissionState.SEARCH:
             print("   Status: Searching for target...")
             if self.target_data:
-                print(f"   Last target: ({self.target_data['lat']:.6f}, {self.target_data['lon']:.6f})")
+                if 'lat' in self.target_data and 'lon' in self.target_data:
+                    print(f"   Last target: ({self.target_data['lat']:.6f}, {self.target_data['lon']:.6f})")
+                else:
+                    print(
+                        f"   Last target: {self.target_data.get('label', 'unknown')} "
+                        f"conf={self.target_data.get('confidence', 'N/A')}"
+                    )
         elif self.mission_state == MissionState.ENGAGE:
             print("   Status: 🔥 ENGAGING TARGET!")
             if self.target_data:
-                print(f"   🎯 Target: ({self.target_data['lat']:.6f}, {self.target_data['lon']:.6f})")
+                if 'lat' in self.target_data and 'lon' in self.target_data:
+                    print(f"   🎯 Target: ({self.target_data['lat']:.6f}, {self.target_data['lon']:.6f})")
+                else:
+                    print(
+                        f"   🎯 Target: {self.target_data.get('label', 'unknown')} "
+                        f"conf={self.target_data.get('confidence', 'N/A')}"
+                    )
                 print(f"   Confidence: {self.target_data.get('confidence', 'N/A')}")
             print("   Task assignments:")
             for slave_id, task in self.slave_tasks.items():
@@ -492,13 +548,34 @@ class SwarmMaster:
 
     def _detect_targets(self):
         """Hedef tespiti yap."""
-        # Gerçek uygulamada camera frame'i alınacak
-        # Şu anda simülasyon için 10 saniyelik bir delay ile manuel hedef simülasyonu
+        if self.target_detector is None:
+            return None
+
+        annotated_frame, detections = self.target_detector.detect_from_source()
+        if detections:
+            best_detection = max(detections, key=lambda item: item.get('confidence', 0.0))
+            master_location = self.vehicle.location.global_relative_frame if self.vehicle else None
+            master_lat = master_location.lat if master_location and master_location.lat is not None else 0.0
+            master_lon = master_location.lon if master_location and master_location.lon is not None else 0.0
+            print(
+                f"[VISION] UAV tespit edildi: {best_detection['label']} "
+                f"conf={best_detection['confidence']:.2f}"
+            )
+            return {
+                'lat': master_lat + 0.0001,
+                'lon': master_lon + 0.0001,
+                'confidence': best_detection.get('confidence', 0.0),
+                'label': best_detection.get('label', 'unknown'),
+                'bbox': best_detection.get('xyxy'),
+                'source': 'camera',
+            }
+
+        # Kamera kaynağı yoksa veya hiç tespit yoksa mevcut simülasyon fallback'i
         if not hasattr(self, '_search_start_time') or self._search_start_time is None:
             self._search_start_time = time.time()
 
         elapsed = time.time() - self._search_start_time
-        if elapsed > 10:  # 10 saniye sonra hedef tespit et
+        if elapsed > 10:
             print("Simulated target detected!")
             self._search_start_time = None
             master_location = self.vehicle.location.global_relative_frame if self.vehicle else None
@@ -509,7 +586,9 @@ class SwarmMaster:
             return {
                 'lat': master_lat + 0.0001,
                 'lon': master_lon + 0.0001,
-                'confidence': 0.95
+                'confidence': 0.95,
+                'label': 'simulated_target',
+                'source': 'simulation',
             }
         return None
 
@@ -687,12 +766,15 @@ class SwarmMaster:
         self._tasks_assigned = True
         for slave_id, slave in self.slave_vehicles.items():
             task = self.slave_tasks.get(slave_id, "FORMATION_HOLD")
-            target_lat = self.target_data['lat'] if self.target_data else 0.0
-            target_lon = self.target_data['lon'] if self.target_data else 0.0
+            target_lat = self.target_data['lat'] if self.target_data and 'lat' in self.target_data else 0.0
+            target_lon = self.target_data['lon'] if self.target_data and 'lon' in self.target_data else 0.0
             
             print(f"\n🎯 [TASK] Assigning task to Slave {slave_id}")
             print(f"   Task: {task}")
-            print(f"   Target: lat={target_lat:.6f}, lon={target_lon:.6f}")
+            if self.target_data and 'lat' in self.target_data and 'lon' in self.target_data:
+                print(f"   Target: lat={target_lat:.6f}, lon={target_lon:.6f}")
+            else:
+                print(f"   Target: {self.target_data.get('label', 'camera_target') if self.target_data else 'camera_target'}")
             
             if task == "FOLLOW_TARGET":
                 print(f"   → Slave {slave_id} will directly follow the target")
@@ -874,7 +956,13 @@ class SwarmMaster:
                     # ENGAGE hedef log'u periyodik kalsın
                     if self.mission_state == MissionState.ENGAGE and loop_count % 10 == 0:
                         if self.target_data:
-                            print(f"[ENGAGE] Target: ({self.target_data['lat']:.6f}, {self.target_data['lon']:.6f})")
+                            if 'lat' in self.target_data and 'lon' in self.target_data:
+                                print(f"[ENGAGE] Target: ({self.target_data['lat']:.6f}, {self.target_data['lon']:.6f})")
+                            else:
+                                print(
+                                    f"[ENGAGE] Target: {self.target_data.get('label', 'unknown')} "
+                                    f"conf={self.target_data.get('confidence', 'N/A')}"
+                                )
 
                     time.sleep(2)  # 2 saniye bekle
                 else:
@@ -926,11 +1014,12 @@ def main():
     parser.add_argument("--slave3", default="127.0.0.1:15580", help="Slave 3 connection")
     parser.add_argument("--slave4", default="127.0.0.1:15590", help="Slave 4 connection")
     parser.add_argument("--enemy", default="127.0.0.1:15610", help="Enemy UAV connection (default: dedicated MAVProxy out port)")
+    parser.add_argument("--target-camera-source", default="0", help="Target detection camera source index/URL")
     parser.add_argument("--takeoff-altitude", type=float, default=50.0, help="Formation takeoff altitude")
     parser.add_argument("--formation-duration", type=float, help="Optional formation runtime in seconds")
     args = parser.parse_args()
 
-    master = SwarmMaster(args.master, enemy_connection_string=args.enemy)
+    master = SwarmMaster(args.master, enemy_connection_string=args.enemy, target_camera_source=args.target_camera_source)
 
     try:
         master.connect()
@@ -1045,6 +1134,11 @@ def main():
             master.disarm_all()
         except Exception as exc:
             print(f"[WARNING] Error during disarm cleanup: {exc}")
+        try:
+            if hasattr(master, 'target_detector') and master.target_detector:
+                master.target_detector.close()
+        except Exception as exc:
+            print(f"[WARNING] Error closing target detector: {exc}")
         try:
             master.close()
         except Exception as exc:

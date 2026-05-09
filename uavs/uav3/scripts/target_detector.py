@@ -5,11 +5,24 @@ Görüntü işleme ile hedef tespiti ve takip
 """
 
 import cv2
-import numpy as np
 import json
 from datetime import datetime
-from dronekit import connect
 import argparse
+import collections.abc
+import collections
+import sys
+from pathlib import Path
+
+collections.MutableMapping = collections.abc.MutableMapping
+
+from dronekit import connect
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+VISION_DIR = PROJECT_ROOT / "Goruntu_isleme"
+if str(VISION_DIR) not in sys.path:
+    sys.path.insert(0, str(VISION_DIR))
+
+from object_detector import SharedYOLODetector
 
 class TargetDetector:
     def __init__(self, connection_string, vehicle_id=3, camera_port=8080):
@@ -18,6 +31,7 @@ class TargetDetector:
         self.camera_port = camera_port
         self.vehicle = None
         self.targets = []
+        self.detector = SharedYOLODetector()
         
     def connect(self):
         """Araca bağlan"""
@@ -27,40 +41,24 @@ class TargetDetector:
         
     def detect_targets(self, frame, threshold=0.5):
         """
-        Frame'de hedefler tespit et
-        Şu anki placeholder: renk-temelli tespit
+        Frame'de hedefler tespit et.
+        Ultralytics YOLO modelini kullanır.
         """
-        # HSV'ye dönüştür
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # Kırmızı renk masksı (hedef rengi)
-        lower_red1 = np.array([0, 100, 100])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 100, 100])
-        upper_red2 = np.array([180, 255, 255])
-        
-        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        mask = cv2.bitwise_or(mask1, mask2)
-        
-        # Kontürleri bul
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        
+        annotated_frame, detections = self.detector.annotate(frame)
         targets = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > 100:  # Minimum alan
-                M = cv2.moments(contour)
-                if M['m00'] > 0:
-                    cx = int(M['m10'] / M['m00'])
-                    cy = int(M['m01'] / M['m00'])
-                    targets.append({
-                        'center': (cx, cy),
-                        'area': area,
-                        'contour': contour
-                    })
-        
-        return targets, mask
+        for detection in detections:
+            x1, y1, x2, y2 = detection["xyxy"]
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            targets.append({
+                'label': detection['label'],
+                'confidence': detection['confidence'],
+                'center': (center_x, center_y),
+                'area': float((x2 - x1) * (y2 - y1)),
+                'bbox': detection['xyxy']
+            })
+
+        return targets, annotated_frame
         
     def log_detection(self, targets):
         """Tespit sonuçlarını kaydet"""
@@ -71,7 +69,9 @@ class TargetDetector:
             'targets': [
                 {
                     'center': t['center'],
-                    'area': float(t['area'])
+                    'area': float(t['area']),
+                    'label': t.get('label', 'unknown'),
+                    'confidence': float(t.get('confidence', 0.0))
                 }
                 for t in targets
             ]
@@ -88,11 +88,46 @@ class TargetDetector:
             json.dump(self.targets, f, indent=2)
         print(f"Detections saved to {output_file}")
 
+    @staticmethod
+    def _resolve_source(camera_port):
+        try:
+            return int(camera_port)
+        except (TypeError, ValueError):
+            return camera_port
+
+    def run(self):
+        source = self._resolve_source(self.camera_port)
+        print(f"Opening camera source: {source}")
+        capture = cv2.VideoCapture(source)
+
+        if not capture.isOpened():
+            raise RuntimeError(f"Camera source could not be opened: {source}")
+
+        print("Press q to quit the detector window.")
+
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                print("Frame could not be read, retrying...")
+                continue
+
+            targets, annotated_frame = self.detect_targets(frame)
+            if targets:
+                self.log_detection(targets)
+                print(f"Detected {len(targets)} object(s): " + ", ".join(t['label'] for t in targets))
+
+            cv2.imshow(f"Target Detector UAV{self.vehicle_id}", annotated_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        capture.release()
+        cv2.destroyAllWindows()
+
 def main():
     parser = argparse.ArgumentParser(description='UAV Target Detector')
     parser.add_argument('--connection', default='127.0.0.1:15570', help='Vehicle connection string')
     parser.add_argument('--vehicle-id', type=int, default=3, help='Vehicle ID')
-    parser.add_argument('--camera-port', type=int, default=8080, help='Camera streaming port')
+    parser.add_argument('--camera-port', default='0', help='Camera source index/URL/port')
     args = parser.parse_args()
     
     detector = TargetDetector(args.connection, args.vehicle_id, args.camera_port)
@@ -100,8 +135,7 @@ def main():
     try:
         detector.connect()
         print("Target detector initialized")
-        print("Camera stream from localhost:8080")
-        # Real implementation would connect to camera stream
+        detector.run()
         
     except Exception as e:
         print(f"Error: {e}")

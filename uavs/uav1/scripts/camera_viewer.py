@@ -12,6 +12,16 @@ import time
 import sys
 import json
 import base64
+from pathlib import Path
+import argparse
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+VISION_DIR = PROJECT_ROOT / "Goruntu_isleme"
+if str(VISION_DIR) not in sys.path:
+    sys.path.insert(0, str(VISION_DIR))
+
+# Detector is loaded later after parsing args to allow a low-memory "no-detect" mode
+OBJECT_DETECTOR = None
 try:
     import tkinter as tk
     def _get_screen_size():
@@ -54,6 +64,61 @@ TARGET_WIDTH = 600  # 1280 → 600 (width 47%)
 TARGET_HEIGHT = 330  # 720 → 330 (height 46%)
 # RAM azalma: 1280x720x3 → 600x330x3 = 22% (11.5MB → 2.4MB per frame) + 5 kamera (enemy kapalı)
 
+# ---------------------------------------------------------------------------
+# CLI / runtime options (allow disabling detection and reducing resolution/frame rate)
+# ---------------------------------------------------------------------------
+parser = argparse.ArgumentParser(description="Multi-UAV Camera Viewer")
+parser.add_argument("--no-detect", action="store_true", help="Disable YOLO detection to reduce memory/CPU")
+parser.add_argument("--width", type=int, help="Target display width (overrides default)")
+parser.add_argument("--height", type=int, help="Target display height (overrides default)")
+parser.add_argument("--frame-skip", type=int, help="Skip N-1 frames (1=process all, 2=process every 2nd frame)")
+parser.add_argument("--mode", choices=["1", "2"], help="Viewer mode: 1=per-window, 2=grid")
+parser.add_argument("--auto", action="store_true", help="Auto-start viewer without interactive prompt (uses --mode)")
+parser.add_argument("--dump-frames", type=int, help="Dump first N decoded frames per camera to disk for debugging")
+parser.add_argument("--display-scale", type=float, default=1.0, help="Display scale factor for UI windows (e.g. 2.0)")
+parser.add_argument("--detect-every", type=int, default=8, help="Run YOLO every N processed frames (default: 8)")
+parser.add_argument("--detect-imgsz", type=int, default=320, help="YOLO inference image size (default: 320)")
+parser.add_argument("--detect-all", action="store_true", help="Enable YOLO on all cameras (default: only UAV1)")
+parser.add_argument("--grid-layout", choices=["classic", "focus"], default="focus", help="Grid layout for mode=2")
+parser.add_argument("--focus-camera", type=int, default=1, help="Focus camera index (1..5) for focus layout")
+args = parser.parse_args()
+
+if args.width:
+    TARGET_WIDTH = int(args.width)
+if args.height:
+    TARGET_HEIGHT = int(args.height)
+if args.frame_skip:
+    FRAME_SKIP = max(1, int(args.frame_skip))
+DISPLAY_SCALE = max(0.5, float(args.display_scale))
+DETECT_EVERY = max(1, int(args.detect_every))
+DETECT_IMGSZ = max(160, int(args.detect_imgsz))
+DETECT_CAMERA_INDEX_SET = set(range(len(UAV_NAMES))) if args.detect_all else {0}
+GRID_LAYOUT = args.grid_layout
+FOCUS_CAMERA_INDEX = min(max(1, int(args.focus_camera)), len(UAV_NAMES)) - 1
+
+# Try to load detector unless explicitly disabled
+if not args.no_detect:
+    try:
+        from object_detector import SharedYOLODetector
+        OBJECT_DETECTOR = SharedYOLODetector(imgsz=DETECT_IMGSZ)
+        detect_scope = "tum kameralar" if args.detect_all else "yalnizca UAV1"
+        print(f"[✓] Nesne tespit modeli yüklendi: {OBJECT_DETECTOR.model_path}")
+        print(f"[i] YOLO ayari -> imgsz={DETECT_IMGSZ}, detect_every={DETECT_EVERY}, kapsam={detect_scope}")
+    except Exception as exc:
+        OBJECT_DETECTOR = None
+        print(f"[!] Nesne tespit modeli yüklenemedi, sadece görüntü gösterilecek: {exc}")
+else:
+    print("[i] --no-detect set: Nesne tespiti devre disi - daha az bellek/CPU kullanilacak")
+
+# --dump-frames: prepare dump dirs and counters
+DUMP_FRAMES = int(args.dump_frames) if getattr(args, 'dump_frames', None) else 0
+dump_counters = {name: 0 for name in UAV_NAMES}
+if DUMP_FRAMES > 0:
+    dump_root = PROJECT_ROOT / "frames_dump"
+    dump_root.mkdir(parents=True, exist_ok=True)
+    for name in UAV_NAMES:
+        (dump_root / name.replace(' ', '_')).mkdir(parents=True, exist_ok=True)
+
 for name in UAV_NAMES:
     frames[name] = None
     connection_status[name] = "Bağlanıyor..."
@@ -64,10 +129,14 @@ for name in UAV_NAMES:
 frame_times = {}  # name -> (frame_count, timestamp) for FPS calculation
 fps_values = {}   # name -> current FPS value
 fps_history = {}  # name -> list of recent fps values (for smoothing)
+detect_frame_counters = {}  # name -> processed frame count for detection cadence
+last_detection_counts = {}  # name -> last detection count
 for name in UAV_NAMES:
     frame_times[name] = (0, time.time())
     fps_values[name] = 0.0
     fps_history[name] = []
+    detect_frame_counters[name] = 0
+    last_detection_counts[name] = 0
 
 def enable_camera_in_gazebo(plane_index):
     """Gazebo'da kamera streaming'i etkinleştir"""
@@ -165,6 +234,26 @@ def capture_camera_stream(port, name, index):
                     
                     # ⚡ RESOLUTION DOWNSCALE: 1280x720 → 640x360 (RAM -75%)
                     frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
+                    # Optional: dump first decoded frames to disk for offline inspection
+                    try:
+                        if DUMP_FRAMES > 0 and dump_counters.get(name, 0) < DUMP_FRAMES:
+                            dump_path = dump_root / name.replace(' ', '_') / f"frame_{dump_counters[name]:03d}.png"
+                            cv2.imwrite(str(dump_path), frame)
+                            dump_counters[name] += 1
+                            print(f"[D] {name} -> dumped {dump_path}")
+                    except Exception as e:
+                        print(f"[D] dump error {name}: {e}")
+
+                    detection_count = last_detection_counts[name]
+                    if OBJECT_DETECTOR is not None and index in DETECT_CAMERA_INDEX_SET:
+                        detect_frame_counters[name] += 1
+                        if detect_frame_counters[name] % DETECT_EVERY == 0:
+                            try:
+                                frame, detections = OBJECT_DETECTOR.annotate(frame)
+                                detection_count = len(detections)
+                                last_detection_counts[name] = detection_count
+                            except Exception as det_exc:
+                                connection_status[name] = f"⚠️ Tespit Hatası: {str(det_exc)[:24]}"
 
                     frame_counters[name] += 1
                     
@@ -181,12 +270,12 @@ def capture_camera_stream(port, name, index):
                         fps_values[name] = sum(fps_history[name]) / len(fps_history[name])  # Smooth average
                         frame_times[name] = (frame_counters[name], current_time)
                     
-                    connection_status[name] = f"✅ AKTIF | FPS: {fps_values[name]:.1f} | Frame: {frame_counters[name]}"
+                    connection_status[name] = f"✅ AKTIF | FPS: {fps_values[name]:.1f} | Obj: {detection_count} | Frame: {frame_counters[name]}"
 
                     # overlay info with FPS
                     fh, fw = frame.shape[:2]
                     cv2.rectangle(frame, (0, 0), (fw, 45), (0, 0, 0), -1)
-                    overlay_text = f"{name} | FPS: {fps_values[name]:.1f} | Frame: {frame_counters[name]} | Res: {fw}x{fh}"
+                    overlay_text = f"{name} | FPS: {fps_values[name]:.1f} | Obj: {detection_count} | Frame: {frame_counters[name]} | Res: {fw}x{fh}"
                     cv2.putText(frame, overlay_text, (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
                     frames[name] = frame
@@ -230,6 +319,10 @@ def display_camera_window(name, index):
                 disp = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
             else:
                 disp = frame
+            if DISPLAY_SCALE != 1.0:
+                sw = max(1, int(disp.shape[1] * DISPLAY_SCALE))
+                sh = max(1, int(disp.shape[0] * DISPLAY_SCALE))
+                disp = cv2.resize(disp, (sw, sh), interpolation=cv2.INTER_LINEAR)
             cv2.imshow(f"🎥 {name}", disp)
         else:
             # Bekleme ekranı
@@ -246,9 +339,124 @@ def display_camera_window(name, index):
             cv2.destroyAllWindows()
             sys.exit(0)
 
+
+def display_all_windows():
+    """Güncellenmiş: Tek GUI döngüsü ile tüm pencereleri ana iş parçacığında göster"""
+    print("[W] Tüm pencereler - tek GUI döngüsü başlatılıyor...")
+    # Oluştur pencereler
+    for name in UAV_NAMES:
+        cv2.namedWindow(f"🎥 {name}", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            for name in UAV_NAMES:
+                if frames[name] is not None:
+                    frame = frames[name]
+                    h, w = frame.shape[:2]
+                    scale = min(1.0, MAX_SINGLE_W / w, MAX_SINGLE_H / h)
+                    if scale < 1.0:
+                        nw = int(w * scale)
+                        nh = int(h * scale)
+                        disp = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+                    else:
+                        disp = frame
+                    if DISPLAY_SCALE != 1.0:
+                        sw = max(1, int(disp.shape[1] * DISPLAY_SCALE))
+                        sh = max(1, int(disp.shape[0] * DISPLAY_SCALE))
+                        disp = cv2.resize(disp, (sw, sh), interpolation=cv2.INTER_LINEAR)
+                    cv2.imshow(f"🎥 {name}", disp)
+                else:
+                    wait_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(wait_frame, name, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (100, 100, 255), 3)
+                    cv2.putText(wait_frame, connection_status[name], (50, 150), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                    cv2.putText(wait_frame, "Bekleniyor...", (50, 250), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 0), 2)
+                    cv2.imshow(f"🎥 {name}", wait_frame)
+
+            if cv2.waitKey(30) & 0xFF == ord('q'):
+                cv2.destroyAllWindows()
+                sys.exit(0)
+
+            time.sleep(0.02)
+
+    except KeyboardInterrupt:
+        cv2.destroyAllWindows()
+        sys.exit(0)
+
+
+def _make_placeholder(label, width, height, color=(0, 0, 255)):
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(img, label, (max(10, width // 8), height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    return img
+
+
+def _ensure_size(frame, width, height):
+    if frame is None:
+        return np.zeros((height, width, 3), dtype=np.uint8)
+    fh, fw = frame.shape[:2]
+    if (fh, fw) == (height, width):
+        return frame
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def _fit_to_screen(image, margin=100):
+    max_w = max(320, SCREEN_WIDTH - margin)
+    max_h = max(240, SCREEN_HEIGHT - margin)
+    h, w = image.shape[:2]
+    scale = min(1.0, max_w / w, max_h / h)
+    if scale < 1.0:
+        return cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return image
+
+
+def _build_classic_grid(frame_map):
+    cell_w, cell_h = TARGET_WIDTH, TARGET_HEIGHT
+    tiles = []
+    for name in UAV_NAMES:
+        frame = frame_map.get(name)
+        if frame is None:
+            frame = _make_placeholder("WAITING", cell_w, cell_h)
+        tiles.append(_ensure_size(frame, cell_w, cell_h))
+
+    while len(tiles) < 6:
+        tiles.append(_make_placeholder("INACTIVE", cell_w, cell_h, color=(100, 100, 255)))
+
+    row1 = np.hstack([tiles[0], tiles[1], tiles[2]])
+    row2 = np.hstack([tiles[3], tiles[4], tiles[5]])
+    return np.vstack([row1, row2])
+
+
+def _build_focus_grid(frame_map):
+    cell_w, cell_h = TARGET_WIDTH, TARGET_HEIGHT
+    big_w, big_h = cell_w * 4, cell_h * 2
+
+    focus_name = UAV_NAMES[FOCUS_CAMERA_INDEX]
+    focus_frame = frame_map.get(focus_name)
+    if focus_frame is None:
+        focus_frame = _make_placeholder(f"{focus_name} WAITING", big_w, big_h)
+    else:
+        focus_frame = _ensure_size(focus_frame, big_w, big_h)
+
+    others = [n for i, n in enumerate(UAV_NAMES) if i != FOCUS_CAMERA_INDEX]
+    thumbs = []
+    for name in others:
+        frame = frame_map.get(name)
+        if frame is None:
+            frame = _make_placeholder(f"{name[:6]} WAIT", cell_w, cell_h)
+        thumbs.append(_ensure_size(frame, cell_w, cell_h))
+
+    while len(thumbs) < 4:
+        thumbs.append(_make_placeholder("INACTIVE", cell_w, cell_h, color=(100, 100, 255)))
+
+    thumb_row = np.hstack(thumbs[:4])
+    return np.vstack([focus_frame, thumb_row])
+
 def display_combined_grid():
     """Tüm kameraları 3x2 grid'de bir pencerede göster"""
     print("[G] Kombinli Grid - Window başlatılıyor...")
+    window_name = "🎥 Kamera Grid (3x2)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     
     while True:
         try:
@@ -270,21 +478,42 @@ def display_combined_grid():
                 scale = min(1.0, max_cw / cw, max_ch / ch)
                 if scale < 1.0:
                     wait_frame = cv2.resize(wait_frame, (int(cw*scale), int(ch*scale)), interpolation=cv2.INTER_AREA)
-                cv2.imshow("🎥 Kamera Grid (3x2)", wait_frame)
+                cv2.imshow(window_name, wait_frame)
+                try:
+                    cv2.resizeWindow(window_name, wait_frame.shape[1], wait_frame.shape[0])
+                except Exception:
+                    pass
             
             elif len(available_frames) >= len(PORTS):
                 # Tüm kameralar hazır - 3x2 Grid oluştur (veya 5 kamera için 3x2 + placeholder)
                 grid_frames = [frames[name] for name in UAV_NAMES if frames[name] is not None]
-                
+
                 # Placeholder frame'ler ekle (5 kamera için 1 placeholder)
                 while len(grid_frames) < 6:
-                    placeholder = np.zeros((330, 600, 3), dtype=np.uint8)
-                    cv2.putText(placeholder, "INACTIVE", (150, 165), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 255), 2)
+                    placeholder = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(placeholder, "INACTIVE", (max(10, TARGET_WIDTH//4), TARGET_HEIGHT//2), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 255), 2)
                     grid_frames.append(placeholder)
-                
-                row1 = np.hstack([grid_frames[0], grid_frames[1], grid_frames[2]])
-                row2 = np.hstack([grid_frames[3], grid_frames[4], grid_frames[5]])
+
+                # Tüm frame'leri hücre boyutuna yeniden boyutlandır (hstack için eşit yükseklik gerekir)
+                cell_w, cell_h = TARGET_WIDTH, TARGET_HEIGHT
+                resized = []
+                for f in grid_frames:
+                    if f is None:
+                        resized.append(np.zeros((cell_h, cell_w, 3), dtype=np.uint8))
+                        continue
+                    fh, fw = f.shape[:2]
+                    if (fh, fw) != (cell_h, cell_w):
+                        try:
+                            rf = cv2.resize(f, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+                        except Exception:
+                            rf = cv2.resize(f, (cell_w, cell_h))
+                        resized.append(rf)
+                    else:
+                        resized.append(f)
+
+                row1 = np.hstack([resized[0], resized[1], resized[2]])
+                row2 = np.hstack([resized[3], resized[4], resized[5]])
                 combined = np.vstack([row1, row2])
                 
                 # Üst bilgi bar'ı ekle
@@ -303,21 +532,46 @@ def display_combined_grid():
                 scale = min(1.0, max_cw / cw, max_ch / ch)
                 if scale < 1.0:
                     combined = cv2.resize(combined, (int(cw*scale), int(ch*scale)), interpolation=cv2.INTER_AREA)
-                cv2.imshow("🎥 Kamera Grid (3x2)", combined)
+                if DISPLAY_SCALE != 1.0:
+                    sw = max(1, int(combined.shape[1] * DISPLAY_SCALE))
+                    sh = max(1, int(combined.shape[0] * DISPLAY_SCALE))
+                    combined = cv2.resize(combined, (sw, sh), interpolation=cv2.INTER_LINEAR)
+                cv2.imshow(window_name, combined)
+                try:
+                    cv2.resizeWindow(window_name, combined.shape[1], combined.shape[0])
+                except Exception:
+                    pass
             
             else:
                 # Kısmi frame'ler - mevcut olanları göster
                 grid_frames = [frames[name] for name in UAV_NAMES if frames[name] is not None]
-                
+
                 # Placeholder frame'ler ekle (5 kamera için max 1 placeholder)
                 while len(grid_frames) < 6:
-                    placeholder = np.zeros((330, 600, 3), dtype=np.uint8)
-                    cv2.putText(placeholder, "WAITING", (140, 165), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                    placeholder = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(placeholder, "WAITING", (max(10, TARGET_WIDTH//6), TARGET_HEIGHT//2), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     grid_frames.append(placeholder)
-                
-                row1 = np.hstack([grid_frames[0], grid_frames[1], grid_frames[2]])
-                row2 = np.hstack([grid_frames[3], grid_frames[4], grid_frames[5]])
+
+                # Normalize all frames to cell size
+                cell_w, cell_h = TARGET_WIDTH, TARGET_HEIGHT
+                resized = []
+                for f in grid_frames:
+                    if f is None:
+                        resized.append(np.zeros((cell_h, cell_w, 3), dtype=np.uint8))
+                        continue
+                    fh, fw = f.shape[:2]
+                    if (fh, fw) != (cell_h, cell_w):
+                        try:
+                            rf = cv2.resize(f, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+                        except Exception:
+                            rf = cv2.resize(f, (cell_w, cell_h))
+                        resized.append(rf)
+                    else:
+                        resized.append(f)
+
+                row1 = np.hstack([resized[0], resized[1], resized[2]])
+                row2 = np.hstack([resized[3], resized[4], resized[5]])
                 combined = np.vstack([row1, row2])
                 cw, ch = combined.shape[1], combined.shape[0]
                 margin = 100
@@ -326,7 +580,15 @@ def display_combined_grid():
                 scale = min(1.0, max_cw / cw, max_ch / ch)
                 if scale < 1.0:
                     combined = cv2.resize(combined, (int(cw*scale), int(ch*scale)), interpolation=cv2.INTER_AREA)
-                cv2.imshow("🎥 Kamera Grid (3x2)", combined)
+                if DISPLAY_SCALE != 1.0:
+                    sw = max(1, int(combined.shape[1] * DISPLAY_SCALE))
+                    sh = max(1, int(combined.shape[0] * DISPLAY_SCALE))
+                    combined = cv2.resize(combined, (sw, sh), interpolation=cv2.INTER_LINEAR)
+                cv2.imshow(window_name, combined)
+                try:
+                    cv2.resizeWindow(window_name, combined.shape[1], combined.shape[0])
+                except Exception:
+                    pass
             
             # q = Quit (⚡ reduced waitKey from 50ms to 16ms for 60fps+)
             if cv2.waitKey(16) & 0xFF == ord('q'):
@@ -359,13 +621,22 @@ if not enable_all_cameras_gazebo():
     print("[!] UYARI: Gazebo kameraları etkinleştirilemedi!")
     print("[!] Gazebo çalışıyor mu kontrol edin (bash baslat.sh)\n")
 
-# Kullanıcıdan seçim al
-while True:
-    choice = input("Seçiminiz (1/2/q): ").strip().lower()
-    
-    if choice in ['1', '2', 'q']:
-        break
-    else:
+# Kullanıcıdan seçim al (varsayılan: her zaman sor)
+# Not: Sadece --auto ve --mode birlikte verilirse prompt atlanır.
+if args.auto and args.mode:
+    choice = args.mode
+    print(f"[i] --auto ile başlatılıyor, mode={choice}")
+else:
+    default_hint = args.mode if args.mode in ['1', '2'] else None
+    while True:
+        if default_hint:
+            raw_choice = input(f"Seçiminiz (1/2/q) [varsayılan {default_hint}]: ").strip().lower()
+            choice = default_hint if raw_choice == '' else raw_choice
+        else:
+            choice = input("Seçiminiz (1/2/q): ").strip().lower()
+
+        if choice in ['1', '2', 'q']:
+            break
         print("[!] Lütfen 1, 2 veya q seçin!")
 
 if choice == '1':
@@ -379,26 +650,13 @@ if choice == '1':
         t.start()
         time.sleep(0.1)
     
-    # Display thread'leri başlat (capture başlasın diye 1 sn bekle)
-    time.sleep(1)
-    for i in range(len(PORTS)):
-        t = threading.Thread(target=display_camera_window, 
-                           args=(UAV_NAMES[i], i), 
-                           daemon=True)
-        t.start()
-        time.sleep(0.1)
-    
     print("\n[✓] Tüm window'lar açıldı!")
     print("[i] Her pencereyi 'q' tuşu ile kapatabilirsiniz")
     print("[i] Tüm window'ları kapatmak için Ctrl+C'ye basın\n")
-    
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[!] Programdan çıkılıyor...")
-        cv2.destroyAllWindows()
-        sys.exit(0)
+
+    # GUI mutlaka ana thread'de çalışsın (Qt/OpenCV thread sorunlarını önler)
+    time.sleep(0.5)
+    display_all_windows()
 
 elif choice == '2':
     print("\n[*] Kombinli Grid viewer başlatılıyor...\n")
@@ -411,21 +669,13 @@ elif choice == '2':
         t.start()
         time.sleep(0.1)
     
-    # Display thread'i başlat (capture başlasın diye 1 sn bekle)
-    time.sleep(1)
-    t = threading.Thread(target=display_combined_grid, daemon=True)
-    t.start()
+    # GUI ana thread'de çalışsın
+    time.sleep(0.5)
     
     print("[✓] Grid viewer açıldı!")
     print("[i] 'q' tuşu veya Ctrl+C ile kapatın\n")
     
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[!] Programdan çıkılıyor...")
-        cv2.destroyAllWindows()
-        sys.exit(0)
+    display_combined_grid()
 
 elif choice == 'q':
     print("[✓] Çıkılıyor...")
