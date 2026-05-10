@@ -14,6 +14,7 @@ import json
 import base64
 from pathlib import Path
 import argparse
+from queue import Queue, Empty, Full
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 VISION_DIR = PROJECT_ROOT / "Goruntu_isleme"
@@ -60,8 +61,8 @@ for name in UAV_NAMES:
 
 # ⚡ PERFORMANS: Frame decimation + Resolution downscale
 FRAME_SKIP = 1  # Her frame'i işle (30fps → 30fps, gerçek-zamanlı akışlı)
-TARGET_WIDTH = 600  # 1280 → 600 (width 47%)
-TARGET_HEIGHT = 330  # 720 → 330 (height 46%)
+TARGET_WIDTH = 640  # 1280 -> 640 (uzak hedef için daha iyi detay)
+TARGET_HEIGHT = 360  # 720 -> 360 (uzak hedef için daha iyi detay)
 # RAM azalma: 1280x720x3 → 600x330x3 = 22% (11.5MB → 2.4MB per frame) + 5 kamera (enemy kapalı)
 
 # ---------------------------------------------------------------------------
@@ -76,9 +77,13 @@ parser.add_argument("--mode", choices=["1", "2"], help="Viewer mode: 1=per-windo
 parser.add_argument("--auto", action="store_true", help="Auto-start viewer without interactive prompt (uses --mode)")
 parser.add_argument("--dump-frames", type=int, help="Dump first N decoded frames per camera to disk for debugging")
 parser.add_argument("--display-scale", type=float, default=1.0, help="Display scale factor for UI windows (e.g. 2.0)")
-parser.add_argument("--detect-every", type=int, default=8, help="Run YOLO every N processed frames (default: 8)")
-parser.add_argument("--detect-imgsz", type=int, default=320, help="YOLO inference image size (default: 320)")
+parser.add_argument("--detect-every", type=int, default=2, help="Run YOLO every N processed frames (default: 2 on GPU)")
+parser.add_argument("--detect-imgsz", type=int, default=640, help="YOLO inference image size (default: 640 for distant targets)")
+parser.add_argument("--detect-conf", type=float, default=0.08, help="YOLO confidence threshold (default: 0.08 for distant/small targets)")
+parser.add_argument("--detect-device", choices=["auto", "cpu", "cuda"], default="auto", help="Inference device")
 parser.add_argument("--detect-all", action="store_true", help="Enable YOLO on all cameras (default: only UAV1)")
+parser.add_argument("--only-camera", type=int, help="Open only one camera (1..5)")
+parser.add_argument("--detect-camera", type=int, help="Run YOLO only on one camera (1..5)")
 parser.add_argument("--grid-layout", choices=["classic", "focus"], default="focus", help="Grid layout for mode=2")
 parser.add_argument("--focus-camera", type=int, default=1, help="Focus camera index (1..5) for focus layout")
 args = parser.parse_args()
@@ -92,7 +97,19 @@ if args.frame_skip:
 DISPLAY_SCALE = max(0.5, float(args.display_scale))
 DETECT_EVERY = max(1, int(args.detect_every))
 DETECT_IMGSZ = max(160, int(args.detect_imgsz))
-DETECT_CAMERA_INDEX_SET = set(range(len(UAV_NAMES))) if args.detect_all else {0}
+DETECT_CONF = max(0.01, min(1.0, float(args.detect_conf)))
+ONLY_CAMERA_INDEX = None
+if args.only_camera is not None:
+    ONLY_CAMERA_INDEX = min(max(1, int(args.only_camera)), len(UAV_NAMES)) - 1
+
+if args.detect_all:
+    DETECT_CAMERA_INDEX_SET = set(range(len(UAV_NAMES)))
+elif args.detect_camera is not None:
+    DETECT_CAMERA_INDEX_SET = {min(max(1, int(args.detect_camera)), len(UAV_NAMES)) - 1}
+else:
+    DETECT_CAMERA_INDEX_SET = {0}
+
+ACTIVE_CAMERA_INDEXES = [ONLY_CAMERA_INDEX] if ONLY_CAMERA_INDEX is not None else list(range(len(UAV_NAMES)))
 GRID_LAYOUT = args.grid_layout
 FOCUS_CAMERA_INDEX = min(max(1, int(args.focus_camera)), len(UAV_NAMES)) - 1
 
@@ -100,10 +117,22 @@ FOCUS_CAMERA_INDEX = min(max(1, int(args.focus_camera)), len(UAV_NAMES)) - 1
 if not args.no_detect:
     try:
         from object_detector import SharedYOLODetector
-        OBJECT_DETECTOR = SharedYOLODetector(imgsz=DETECT_IMGSZ)
-        detect_scope = "tum kameralar" if args.detect_all else "yalnizca UAV1"
+        OBJECT_DETECTOR = SharedYOLODetector(
+            imgsz=DETECT_IMGSZ,
+            conf=DETECT_CONF,
+            device=args.detect_device,
+        )
+        if args.detect_all:
+            detect_scope = "tum kameralar"
+        elif args.detect_camera is not None:
+            detect_scope = f"yalnizca UAV{int(args.detect_camera)}"
+        else:
+            detect_scope = "yalnizca UAV1"
         print(f"[✓] Nesne tespit modeli yüklendi: {OBJECT_DETECTOR.model_path}")
-        print(f"[i] YOLO ayari -> imgsz={DETECT_IMGSZ}, detect_every={DETECT_EVERY}, kapsam={detect_scope}")
+        print(
+            f"[i] YOLO ayari -> device={OBJECT_DETECTOR.device}, fp16={OBJECT_DETECTOR.use_half}, "
+            f"imgsz={DETECT_IMGSZ}, conf={DETECT_CONF}, detect_every={DETECT_EVERY}, kapsam={detect_scope}"
+        )
     except Exception as exc:
         OBJECT_DETECTOR = None
         print(f"[!] Nesne tespit modeli yüklenemedi, sadece görüntü gösterilecek: {exc}")
@@ -131,12 +160,17 @@ fps_values = {}   # name -> current FPS value
 fps_history = {}  # name -> list of recent fps values (for smoothing)
 detect_frame_counters = {}  # name -> processed frame count for detection cadence
 last_detection_counts = {}  # name -> last detection count
+detection_queues = {}  # name -> latest-frame queue for async detection worker
+detection_results = {}  # name -> last detections
+detection_lock = threading.Lock()
 for name in UAV_NAMES:
     frame_times[name] = (0, time.time())
     fps_values[name] = 0.0
     fps_history[name] = []
     detect_frame_counters[name] = 0
     last_detection_counts[name] = 0
+    detection_queues[name] = Queue(maxsize=1)
+    detection_results[name] = []
 
 def enable_camera_in_gazebo(plane_index):
     """Gazebo'da kamera streaming'i etkinleştir"""
@@ -159,13 +193,93 @@ def enable_all_cameras_gazebo():
     time.sleep(3)  # Gazebo'nun hazırlanmasını bekle
     
     success_count = 0
-    for i in range(len(PORTS)):
+    for i in ACTIVE_CAMERA_INDEXES:
         if enable_camera_in_gazebo(i):
             success_count += 1
         time.sleep(0.2)  # Kameralar arası kısa gecikme
     
-    print(f"\n[✓] {success_count}/{len(PORTS)} kamera Gazebo'da açıldı!\n")
+    print(f"\n[✓] {success_count}/{len(ACTIVE_CAMERA_INDEXES)} kamera Gazebo'da açıldı!\n")
     return success_count > 0
+
+
+def _draw_detections(frame, detections):
+    """Draw bounding boxes and labels on frame."""
+    out = frame.copy()
+    for det in detections:
+        try:
+            x1, y1, x2, y2 = [int(v) for v in det.get("xyxy", [0, 0, 0, 0])]
+            label = str(det.get("label", "obj"))
+            conf = float(det.get("confidence", 0.0))
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                out,
+                f"{label} {conf:.2f}",
+                (x1, max(15, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _detect_with_fallback(frame):
+    """Full-frame + center-crop fallback detection for distant targets."""
+    detections = OBJECT_DETECTOR.infer(frame)
+    if detections:
+        return detections
+
+    fh, fw = frame.shape[:2]
+    crop_ratio = 0.6
+    cw = int(fw * crop_ratio)
+    ch = int(fh * crop_ratio)
+    x0 = (fw - cw) // 2
+    y0 = (fh - ch) // 2
+    crop = frame[y0:y0 + ch, x0:x0 + cw]
+    crop_dets = OBJECT_DETECTOR.infer(crop)
+
+    if not crop_dets:
+        return []
+
+    remapped = []
+    for det in crop_dets:
+        x1, y1, x2, y2 = det["xyxy"]
+        remapped.append(
+            {
+                "label": det.get("label", "obj"),
+                "confidence": det.get("confidence", 0.0),
+                "xyxy": [x1 + x0, y1 + y0, x2 + x0, y2 + y0],
+            }
+        )
+    return remapped
+
+
+def detection_worker(name, index):
+    """Run YOLO in a separate thread so capture loop stays fast."""
+    queue_obj = detection_queues[name]
+    while True:
+        try:
+            frame = queue_obj.get(timeout=1.0)
+        except Empty:
+            continue
+
+        if frame is None:
+            break
+
+        if OBJECT_DETECTOR is None or index not in DETECT_CAMERA_INDEX_SET:
+            continue
+
+        try:
+            OBJECT_DETECTOR.conf = DETECT_CONF
+            OBJECT_DETECTOR.imgsz = DETECT_IMGSZ
+            detections = _detect_with_fallback(frame)
+            with detection_lock:
+                detection_results[name] = detections
+                last_detection_counts[name] = len(detections)
+        except Exception as det_exc:
+            connection_status[name] = f"⚠️ Tespit Hatası: {str(det_exc)[:24]}"
 
 def capture_camera_stream(port, name, index):
     """Her kamera için ayrı thread - OpenCV ile RTP stream oku"""
@@ -215,16 +329,13 @@ def capture_camera_stream(port, name, index):
                     if not data_b64 or w == 0 or h == 0:
                         continue
                     
-                    # ⚡ BUFFER POOLING: Decode base64 directly to pre-allocated buffer
+                    # Decode base64 to numpy view (avoid extra copy/copyto cost)
                     try:
                         raw_bytes = base64.b64decode(data_b64)
                         if len(raw_bytes) != w * h * 3:
                             connection_status[name] = f"❌ Veri boyutu {len(raw_bytes)} != {w*h*3}"
                             continue
-                        # Copy to pre-allocated buffer
-                        np.copyto(rgb_buffers[name][:h, :w, :], 
-                                 np.frombuffer(raw_bytes, dtype=np.uint8).reshape((h, w, 3)))
-                        frame = rgb_buffers[name][:h, :w, :].copy()  # Copy for safety
+                        frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((h, w, 3))
                     except Exception as decode_err:
                         connection_status[name] = f"❌ Decode: {str(decode_err)[:20]}"
                         continue
@@ -249,11 +360,21 @@ def capture_camera_stream(port, name, index):
                         detect_frame_counters[name] += 1
                         if detect_frame_counters[name] % DETECT_EVERY == 0:
                             try:
-                                frame, detections = OBJECT_DETECTOR.annotate(frame)
-                                detection_count = len(detections)
-                                last_detection_counts[name] = detection_count
+                                queue_obj = detection_queues[name]
+                                if queue_obj.full():
+                                    try:
+                                        queue_obj.get_nowait()
+                                    except Empty:
+                                        pass
+                                queue_obj.put_nowait(frame.copy())
                             except Exception as det_exc:
                                 connection_status[name] = f"⚠️ Tespit Hatası: {str(det_exc)[:24]}"
+
+                        with detection_lock:
+                            detections = detection_results.get(name, [])
+                            detection_count = last_detection_counts.get(name, 0)
+                        if detections:
+                            frame = _draw_detections(frame, detections)
 
                     frame_counters[name] += 1
                     
@@ -306,6 +427,12 @@ def capture_camera_stream(port, name, index):
 def display_camera_window(name, index):
     """Her kamera için ayrı window göster"""
     print(f"[W] {name} - Window başlatılıyor...")
+    window_name = f"🎥 {name}"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    try:
+        cv2.resizeWindow(window_name, int(MAX_SINGLE_W * 0.95), int(MAX_SINGLE_H * 0.95))
+    except Exception:
+        pass
     
     while True:
         if frames[name] is not None:
@@ -323,16 +450,26 @@ def display_camera_window(name, index):
                 sw = max(1, int(disp.shape[1] * DISPLAY_SCALE))
                 sh = max(1, int(disp.shape[0] * DISPLAY_SCALE))
                 disp = cv2.resize(disp, (sw, sh), interpolation=cv2.INTER_LINEAR)
-            cv2.imshow(f"🎥 {name}", disp)
+            cv2.imshow(window_name, disp)
+            try:
+                cv2.resizeWindow(window_name, disp.shape[1], disp.shape[0])
+            except Exception:
+                pass
         else:
             # Bekleme ekranı
-            wait_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(wait_frame, name, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (100, 100, 255), 3)
-            cv2.putText(wait_frame, connection_status[name], (50, 150), 
+            wait_frame = np.zeros((int(MAX_SINGLE_H * 0.75), int(MAX_SINGLE_W * 0.75), 3), dtype=np.uint8)
+            cv2.putText(wait_frame, name, (50, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (100, 100, 255), 3)
+            cv2.putText(wait_frame, connection_status[name], (50, 150),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-            cv2.putText(wait_frame, "Bekleniyor...", (50, 250), 
+            cv2.putText(wait_frame, "Gazebo frame bekleniyor...", (50, 250),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 0), 2)
-            cv2.imshow(f"🎥 {name}", wait_frame)
+            cv2.putText(wait_frame, "enemy_track on sonra 2-5 sn bekleyin", (50, 310),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 0), 2)
+            cv2.imshow(window_name, wait_frame)
+            try:
+                cv2.resizeWindow(window_name, wait_frame.shape[1], wait_frame.shape[0])
+            except Exception:
+                pass
         
         # q = Quit (⚡ reduced waitKey from 50ms to 16ms for 60fps+)
         if cv2.waitKey(16) & 0xFF == ord('q'):
@@ -641,9 +778,20 @@ else:
 
 if choice == '1':
     print("\n[*] Her kamera için ayrı OpenCV window açılıyor...\n")
+
+    # Detection workers: YOLO ayrı thread'de çalışsın, capture bloklanmasın.
+    if OBJECT_DETECTOR is not None:
+        for i in ACTIVE_CAMERA_INDEXES:
+            if i in DETECT_CAMERA_INDEX_SET:
+                dt = threading.Thread(
+                    target=detection_worker,
+                    args=(UAV_NAMES[i], i),
+                    daemon=True,
+                )
+                dt.start()
     
     # Capture thread'leri başlat
-    for i in range(len(PORTS)):
+    for i in ACTIVE_CAMERA_INDEXES:
         t = threading.Thread(target=capture_camera_stream, 
                            args=(PORTS[i], UAV_NAMES[i], i), 
                            daemon=True)
@@ -660,9 +808,20 @@ if choice == '1':
 
 elif choice == '2':
     print("\n[*] Kombinli Grid viewer başlatılıyor...\n")
+
+    # Detection workers: YOLO ayrı thread'de çalışsın, capture bloklanmasın.
+    if OBJECT_DETECTOR is not None:
+        for i in ACTIVE_CAMERA_INDEXES:
+            if i in DETECT_CAMERA_INDEX_SET:
+                dt = threading.Thread(
+                    target=detection_worker,
+                    args=(UAV_NAMES[i], i),
+                    daemon=True,
+                )
+                dt.start()
     
     # Capture thread'leri başlat
-    for i in range(len(PORTS)):
+    for i in ACTIVE_CAMERA_INDEXES:
         t = threading.Thread(target=capture_camera_stream, 
                            args=(PORTS[i], UAV_NAMES[i], i), 
                            daemon=True)
@@ -674,8 +833,12 @@ elif choice == '2':
     
     print("[✓] Grid viewer açıldı!")
     print("[i] 'q' tuşu veya Ctrl+C ile kapatın\n")
-    
-    display_combined_grid()
+
+    if len(ACTIVE_CAMERA_INDEXES) == 1:
+        active_index = ACTIVE_CAMERA_INDEXES[0]
+        display_camera_window(UAV_NAMES[active_index], active_index)
+    else:
+        display_combined_grid()
 
 elif choice == 'q':
     print("[✓] Çıkılıyor...")

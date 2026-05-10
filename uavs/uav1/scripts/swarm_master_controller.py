@@ -12,12 +12,14 @@ import argparse
 import enum
 import math
 import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 import cv2
+import logging
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 VISION_DIR = PROJECT_ROOT / "Goruntu_isleme"
@@ -28,6 +30,9 @@ from object_detector import SharedYOLODetector
 
 from dronekit import LocationGlobalRelative, VehicleMode, connect
 import dronekit
+
+logging.getLogger("dronekit").setLevel(logging.ERROR)
+logging.getLogger("pymavlink").setLevel(logging.ERROR)
 
 
 class TargetDetector:
@@ -90,7 +95,7 @@ class MissionState(enum.Enum):
 
 
 class SwarmMaster:
-    def __init__(self, connection_string, vehicle_id=1, enemy_connection_string="127.0.0.1:15610", target_camera_source="0"):
+    def __init__(self, connection_string, vehicle_id=1, enemy_connection_string="udp:127.0.0.1:15610", target_camera_source="0"):
         self.connection_string = connection_string
         self.vehicle_id = vehicle_id
         self.enemy_connection_string = enemy_connection_string
@@ -116,6 +121,7 @@ class SwarmMaster:
         self.enemy_tracking_active = False
         self.enemy_connecting = False
         self.last_enemy_update = 0
+        self.enemy_camera_process = None
         # Mission state
         self.mission_state = MissionState.IDLE
         self.target_data = None
@@ -150,14 +156,16 @@ class SwarmMaster:
 
         Returns the connected vehicle or raises the last exception.
         """
-        variants = [conn_str]
-        if not conn_str.startswith("tcp:") and not conn_str.startswith("udp:") and not conn_str.startswith("serial:"):
+        variants = [self._normalize_connection_string(conn_str)]
+        if variants[0] != conn_str:
+            variants.append(conn_str)
+        if not conn_str.startswith(("tcp:", "udp:", "serial:")):
             variants.extend([f"tcp:{conn_str}", f"udp:{conn_str}"])
 
         last_exc = None
         for uri in variants:
             try:
-                v = connect(uri, wait_ready=False, timeout=timeout, heartbeat_timeout=60)
+                v = connect(uri, wait_ready=False, timeout=timeout, heartbeat_timeout=120)
                 return v
             except Exception as e:
                 last_exc = e
@@ -165,6 +173,13 @@ class SwarmMaster:
                 time.sleep(0.5)
 
         raise last_exc
+
+    @staticmethod
+    def _normalize_connection_string(conn_str):
+        """Default naked host:port values to UDP, matching MAVProxy out ports."""
+        if conn_str.startswith(("tcp:", "udp:", "serial:")):
+            return conn_str
+        return f"udp:{conn_str}"
 
     def add_slave(self, slave_id, connection_string):
         """Slave araci ekle."""
@@ -201,6 +216,72 @@ class SwarmMaster:
             except Exception as exc2:
                 print(f"Final attempt failed for enemy UAV: {exc2}")
                 # Enemy is optional - allow mission to continue
+
+    def _start_enemy_camera_viewer(self):
+        """UAV2 camera viewer'ı enemy_track başladığında otomatik aç."""
+        if self.enemy_camera_process and self.enemy_camera_process.poll() is None:
+            print("ℹ️ UAV2 camera viewer zaten açık")
+            return
+
+        # Aynı kullanıcı oturumunda eski viewer kalmışsa tekilliği bozmasın.
+        try:
+            subprocess.run(["pkill", "-f", f"{Path(__file__).resolve().with_name('camera_viewer.py')}"])
+        except Exception:
+            pass
+
+        viewer_path = Path(__file__).resolve().with_name("camera_viewer.py")
+        cmd = [
+            sys.executable,
+            str(viewer_path),
+            "--auto",
+            "--mode",
+            "2",
+            "--only-camera",
+            "2",
+            "--detect-camera",
+            "2",
+            "--frame-skip",
+            "1",
+            "--width",
+            "640",
+            "--height",
+            "360",
+            "--display-scale",
+            "1.8",
+            "--detect-every",
+            "2",
+            "--detect-conf",
+            "0.08",
+            "--detect-imgsz",
+            "640",
+            "--detect-device",
+            "cuda",
+        ]
+
+        try:
+            self.enemy_camera_process = subprocess.Popen(cmd)
+            print("[CAMERA] UAV2 camera viewer başlatıldı")
+        except Exception as exc:
+            self.enemy_camera_process = None
+            print(f"[CAMERA] UAV2 camera viewer başlatılamadı: {exc}")
+
+    def _stop_enemy_camera_viewer(self):
+        """enemy_track kapandığında UAV2 camera viewer'ı kapat."""
+        proc = self.enemy_camera_process
+        if not proc:
+            return
+
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        self.enemy_camera_process = None
 
     def _set_guided(self, vehicle):
         if vehicle.mode.name != "GUIDED":
@@ -643,12 +724,10 @@ class SwarmMaster:
                 slave.simple_goto(target_loc)
 
     def track_enemy_slave2(self):
-        """Slave 2'yi enemy'nin TAM 5m arkasında dinamik hızla takip etmesini sağla.
-        
-        Slave2 aktif olarak mesafeyi monitor eder ve hızını dinamik ayarlar:
-        - Enemy'ye > 5.5m uzaksa hızlan (yaklaş)
-        - Enemy'ye < 4.5m yakınsa yavaşla (uzaklaş)
-        - 4.5-5.5m arasında ise sabit tut (maintain)
+        """Track enemy for Slave 2 (ArduPlane-friendly guidance).
+
+        Keeps ~10m distance by commanding a behind-target waypoint and
+        bounded speed updates.
         """
         if self.enemy_tracking_active:
             print("ℹ️ Enemy tracking zaten aktif")
@@ -658,82 +737,115 @@ class SwarmMaster:
             print("ℹ️ Enemy bağlantısı zaten kuruluyor, lütfen bekleyin")
             return
 
-        # Connect to enemy if not already connected
+        # Ensure enemy connection
         if not self.enemy_vehicle:
             self.enemy_connecting = True
             print("🔗 Connecting to Enemy UAV (on-demand for tracking)...")
             self.add_enemy(self.enemy_connection_string)
             self.enemy_connecting = False
-        
+
         if not self.enemy_vehicle or not self.slave_vehicles.get(2):
             print("❌ Enemy vehicle veya Slave 2 bağlı değil")
             return
-        
+
         slave2 = self.slave_vehicles.get(2)
         self._set_guided(slave2)
-        print("🎯 Slave 2 enemy tracking başlatıldı (5m arkada sabit tutulacak, dinamik hız)")
+        print("🎯 Slave 2 enemy tracking başlatıldı (10m takip, plane-friendly)")
         self.enemy_tracking_active = True
-        
+
         try:
+            target_distance = 10.0
+            # Distance error is in meters, so gain must stay small.
+            k_p = 0.08
             tracking_count = 0
-            current_speed = 18.0  # Başlangıç hızı
-            
+
             while self.enemy_tracking_active:
                 if not self._has_valid_position(self.enemy_vehicle) or not self._has_valid_position(slave2):
-                    time.sleep(1)
+                    time.sleep(0.5)
                     continue
-                
-                # Enemy ve Slave2 konumlarını al
+
                 enemy_loc = self.enemy_vehicle.location.global_relative_frame
                 slave2_loc = slave2.location.global_relative_frame
-                enemy_alt = enemy_loc.alt if enemy_loc.alt else 50
+                enemy_alt = enemy_loc.alt if enemy_loc.alt is not None else 50
 
-                # Enemy'ye anlık mesafeyi hesapla
+                # Enemy velocity (north, east, down)
+                enemy_vel = getattr(self.enemy_vehicle, 'velocity', None)
+                if enemy_vel and len(enemy_vel) >= 2:
+                    enemy_speed = math.hypot(enemy_vel[0], enemy_vel[1])
+                else:
+                    enemy_speed = 15.0
+
+                # Distance (meters)
                 current_distance = self._calculate_distance(
-                    slave2_loc.lat,
-                    slave2_loc.lon,
-                    enemy_loc.lat,
-                    enemy_loc.lon
+                    slave2_loc.lat, slave2_loc.lon, enemy_loc.lat, enemy_loc.lon
                 )
 
-                # Dinamik hız kontrolü: mesafeye bağlı olarak hızı ayarla
-                # Hedef: 5m ± 1m (4.5-5.5m band)
-                if current_distance > 5.5:
-                    # Çok uzak - hızlan ve yaklaş
-                    # Uzaklık arttıkça daha agresif hızlan
-                    distance_error = current_distance - 5.0
-                    current_speed = min(18.0 + (distance_error * 1.5), 24.0)
-                elif current_distance < 4.5:
-                    # Çok yakın - yavaşla ve uzaklaş
-                    distance_error = 5.0 - current_distance
-                    current_speed = max(12.0, 18.0 - (distance_error * 1.5))
-                else:
-                    # Band içinde - sabit tut (hysteresis)
-                    pass
+                distance_error = current_distance - target_distance
 
+                # Proportional feedback for desired speed (bounded)
+                desired_speed = enemy_speed + (distance_error * k_p)
+                desired_speed = max(14.0, min(desired_speed, 32.0))
+
+                # Compute enemy heading unit vector from velocity; if weak velocity,
+                # fall back to line-of-sight from slave to enemy.
+                if enemy_vel and len(enemy_vel) >= 2 and math.hypot(enemy_vel[0], enemy_vel[1]) > 1.0:
+                    heading_n = enemy_vel[0] / max(enemy_speed, 1e-6)
+                    heading_e = enemy_vel[1] / max(enemy_speed, 1e-6)
+                else:
+                    d_lat_m = (enemy_loc.lat - slave2_loc.lat) * 111111.0
+                    d_lon_m = (enemy_loc.lon - slave2_loc.lon) * 111111.0 * max(math.cos(math.radians(enemy_loc.lat)), 1e-6)
+                    los_norm = math.hypot(d_lat_m, d_lon_m)
+                    if los_norm > 1e-3:
+                        heading_n = d_lat_m / los_norm
+                        heading_e = d_lon_m / los_norm
+                    else:
+                        heading_n, heading_e = 1.0, 0.0
+
+                # Target point = 10m behind enemy along enemy heading.
+                behind_n_m = -heading_n * target_distance
+                behind_e_m = -heading_e * target_distance
+                target_lat = enemy_loc.lat + (behind_n_m / 111111.0)
+                target_lon = enemy_loc.lon + (
+                    behind_e_m / (111111.0 * max(math.cos(math.radians(enemy_loc.lat)), 1e-6))
+                )
+                target_loc = LocationGlobalRelative(target_lat, target_lon, enemy_alt)
+
+                # Plane guidance: waypoint + speed command.
                 try:
-                    slave2.airspeed = current_speed
+                    slave2.airspeed = desired_speed
                 except Exception:
                     pass
-                
-                # Enemy'nin 5m arkasını hedef konum olarak belirle
-                target_loc = self.get_location_metres(
-                    LocationGlobalRelative(enemy_loc.lat, enemy_loc.lon, enemy_alt),
-                    -5,  # 5m behind (south)
-                    0,   # Center (no left/right offset)
-                    enemy_alt
-                )
-                
-                # Slave 2'ye komut gönder
+                try:
+                    slave2.groundspeed = desired_speed
+                except Exception:
+                    pass
+                try:
+                    msg = slave2.message_factory.command_long_encode(
+                        0, 0,
+                        178,  # MAV_CMD_DO_CHANGE_SPEED
+                        0,
+                        0,  # 0: airspeed
+                        desired_speed,
+                        -1,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    slave2.send_mavlink(msg)
+                except Exception:
+                    pass
                 slave2.simple_goto(target_loc)
-                
+
                 tracking_count += 1
                 if tracking_count % 5 == 0:
-                    print(f"[SLAVE2_TRACK] Enemy: ({enemy_loc.lat:.6f}, {enemy_loc.lon:.6f}) | "
-                          f"Slave2 distance: {current_distance:.1f}m | Speed: {current_speed:.1f} m/s")
-                
-                time.sleep(2)  # 2 saniyede bir güncelle
-        
+                    print(
+                        f"Distance | Enemy Speed | Slave2 Target Speed -> "
+                        f"{current_distance:.1f}m | {enemy_speed:.1f} m/s | {desired_speed:.1f} m/s"
+                    )
+
+                time.sleep(0.5)
+
         except KeyboardInterrupt:
             print("\n🛑 Slave 2 tracking durduruldu")
         except Exception as exc:
@@ -1008,12 +1120,12 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     parser = argparse.ArgumentParser(description="Swarm Master Controller")
-    parser.add_argument("--master", default="127.0.0.1:15550", help="Master vehicle connection")
-    parser.add_argument("--slave1", default="127.0.0.1:15560", help="Slave 1 connection")
-    parser.add_argument("--slave2", default="127.0.0.1:15570", help="Slave 2 connection")
-    parser.add_argument("--slave3", default="127.0.0.1:15580", help="Slave 3 connection")
-    parser.add_argument("--slave4", default="127.0.0.1:15590", help="Slave 4 connection")
-    parser.add_argument("--enemy", default="127.0.0.1:15610", help="Enemy UAV connection (default: dedicated MAVProxy out port)")
+    parser.add_argument("--master", default="udp:127.0.0.1:15550", help="Master vehicle connection")
+    parser.add_argument("--slave1", default="udp:127.0.0.1:15560", help="Slave 1 connection")
+    parser.add_argument("--slave2", default="udp:127.0.0.1:15570", help="Slave 2 connection")
+    parser.add_argument("--slave3", default="udp:127.0.0.1:15580", help="Slave 3 connection")
+    parser.add_argument("--slave4", default="udp:127.0.0.1:15590", help="Slave 4 connection")
+    parser.add_argument("--enemy", default="udp:127.0.0.1:15610", help="Enemy UAV connection (default: dedicated MAVProxy out port)")
     parser.add_argument("--target-camera-source", default="0", help="Target detection camera source index/URL")
     parser.add_argument("--takeoff-altitude", type=float, default=50.0, help="Formation takeoff altitude")
     parser.add_argument("--formation-duration", type=float, help="Optional formation runtime in seconds")
@@ -1081,9 +1193,11 @@ def main():
                         # Background thread'de çalıştır (blocking olmaz)
                         tracking_thread = threading.Thread(target=master.track_enemy_slave2, daemon=True)
                         tracking_thread.start()
+                        master._start_enemy_camera_viewer()
                 elif cmd == "enemy_track off":
                     print("Enemy tracking durdurulması istendi...")
                     master.enemy_tracking_active = False
+                    master._stop_enemy_camera_viewer()
                 elif cmd.startswith("speed"):
                     parts = cmd.split()
                     if len(parts) >= 3:
