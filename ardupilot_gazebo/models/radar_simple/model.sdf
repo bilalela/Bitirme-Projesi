@@ -12,8 +12,10 @@
           </box>
         </geometry>
         <material>
-          <ambient>0.2 0.2 0.2 1</ambient>
-          <diffuse>0.3 0.3 0.3 1</diffuse>
+          <!-- dark metallic base -->
+          <ambient>0.12 0.12 0.12 1</ambient>
+          <diffuse>0.18 0.18 0.20 1</diffuse>
+          <specular>0.3 0.3 0.32 1</specular>
         </material>
       </visual>
 
@@ -27,8 +29,10 @@
           </cylinder>
         </geometry>
         <material>
-          <ambient>0.8 0.8 0.8 1</ambient>
-          <diffuse>0.9 0.9 0.9 1</diffuse>
+          <!-- metallic dish (light grey) -->
+          <ambient>0.6 0.6 0.62 1</ambient>
+          <diffuse>0.78 0.78 0.80 1</diffuse>
+          <specular>0.9 0.9 0.9 1</specular>
         </material>
       </visual>
 
@@ -42,7 +46,9 @@
           </cylinder>
         </geometry>
         <material>
-          <ambient>0.4 0.4 0.4 1</ambient>
+          <!-- mast color darker grey -->
+          <ambient>0.25 0.25 0.26 1</ambient>
+          <diffuse>0.3 0.3 0.32 1</diffuse>
         </material>
       </visual>
 
