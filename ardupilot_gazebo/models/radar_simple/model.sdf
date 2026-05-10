@@ -1,0 +1,51 @@
+<?xml version='1.0'?>
+<sdf version='1.6'>
+  <model name='radar_simple'>
+    <static>true</static>
+    <link name='link'>
+      <pose>0 0 0 0 0 0</pose>
+      <!-- Base platform -->
+      <visual name='platform'>
+        <geometry>
+          <box>
+            <size>2 2 0.4</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.3 0.3 0.3 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- Radar dish -->
+      <visual name='dish'>
+        <pose>0 0 0.55 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.7</radius>
+            <length>0.08</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.8 0.8 0.8 1</ambient>
+          <diffuse>0.9 0.9 0.9 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- Radar mast -->
+      <visual name='mast'>
+        <pose>0 0 0.25 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.08</radius>
+            <length>0.5</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.4 0.4 0.4 1</ambient>
+        </material>
+      </visual>
+
+    </link>
+  </model>
+</sdf>
