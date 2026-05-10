@@ -160,5 +160,12 @@
     <uri>model://sam_launcher</uri>
   </include>
 
+  <!-- Missile model - spawned dynamically by launch_missile_at_target() -->
+  <include>
+    <name>missile_template</name>
+    <pose>-1000 -1000 -1000 0 0 0</pose>
+    <uri>model://missile</uri>
+  </include>
+
   </world>
 </sdf>

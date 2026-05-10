@@ -133,6 +133,10 @@ class SwarmMaster:
         self.target_detector = TargetDetector(vehicle_id=3, camera_source=target_camera_source)
         self._formation_takeoff_mode = False
         self._tasks_assigned = False  # Guard flag to prevent infinite task assignment
+        
+        # Missile system
+        self.missiles = {}  # missile_id -> {'status', 'position', 'spawned_model_name', 'target_vehicle_id'}
+        self.missile_counter = 0
 
     def connect(self):
         """Master araca baglan."""
@@ -853,6 +857,220 @@ class SwarmMaster:
         finally:
             self.enemy_tracking_active = False
 
+    def launch_missile_at_target(self, launcher_vehicle_id=2, target_vehicle_id=6):
+        """
+        UAV2 veya belirtilen aracından füzeyi ateşle ve hedef araçta takip ettir.
+        Füze Gazebo'da fizik simülasyonuyla spawn edilir.
+        """
+        launcher = self.slave_vehicles.get(launcher_vehicle_id) if launcher_vehicle_id != 1 else self.vehicle
+        target = self.slave_vehicles.get(target_vehicle_id) if target_vehicle_id != 1 else (
+            self.enemy_vehicle if target_vehicle_id == 6 else self.vehicle
+        )
+
+        if launcher is None:
+            print(f"❌ Launcher vehicle {launcher_vehicle_id} bulunamadı")
+            return False
+
+        if target is None:
+            print(f"❌ Target vehicle {target_vehicle_id} bulunamadı")
+            return False
+
+        if not self._has_valid_position(launcher):
+            print(f"❌ Launcher {launcher_vehicle_id} konumu geçersiz")
+            return False
+
+        self.missile_counter += 1
+        missile_id = self.missile_counter
+
+        launcher_loc = launcher.location.global_relative_frame
+        target_loc = target.location.global_relative_frame
+
+        print(f"\n🚀 MISSILE {missile_id} LAUNCH INITIATED")
+        print(f"   Launcher: Vehicle {launcher_vehicle_id} at ({launcher_loc.lat:.6f}, {launcher_loc.lon:.6f}, {launcher_loc.alt:.1f}m)")
+        print(f"   Target: Vehicle {target_vehicle_id} at ({target_loc.lat:.6f}, {target_loc.lon:.6f}, {target_loc.alt:.1f}m)")
+
+        # Füzeyi Gazebo'da spawn et (subprocess ile gz model insert)
+        spawn_cmd = [
+            "gz",
+            "model",
+            "insert",
+            "-f",
+            str(PROJECT_ROOT / "ardupilot_gazebo/models/missile/model.sdf"),
+            "-x",
+            str(launcher_loc.lat),
+            "-y",
+            str(launcher_loc.lon),
+            "-z",
+            str(launcher_loc.alt + 1.0),  # Başlangıç yüksekliği
+        ]
+
+        try:
+            # Gazebo'da spawn et (async olarak)
+            subprocess.Popen(spawn_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"   ✅ Missile spawned in Gazebo")
+        except Exception as exc:
+            print(f"   ⚠️ Gazebo spawn failed (continuing with simulation): {exc}")
+
+        # Füzeyi track listesine ekle
+        self.missiles[missile_id] = {
+            'status': 'active',
+            'launcher_id': launcher_vehicle_id,
+            'target_id': target_vehicle_id,
+            'launch_time': time.time(),
+            'launch_lat': launcher_loc.lat,
+            'launch_lon': launcher_loc.lon,
+            'launch_alt': launcher_loc.alt,
+            'position': {'lat': launcher_loc.lat, 'lon': launcher_loc.lon, 'alt': launcher_loc.alt},
+        }
+
+        # Füzeyi takip etmeye başla (threading'de)
+        missile_thread = threading.Thread(
+            target=self._guide_missile_to_target,
+            args=(missile_id, launcher_vehicle_id, target_vehicle_id),
+            daemon=True
+        )
+        missile_thread.start()
+
+        return True
+
+    def _guide_missile_to_target(self, missile_id, launcher_id, target_id):
+        """
+        Füzeyi hedef araçta takip ettir ve çarpışma kontrol et.
+        Bu fonksiyon ayrı bir thread'de çalışır.
+        """
+        print(f"\n🎯 MISSILE {missile_id} GUIDANCE STARTED (Thread)")
+
+        missile_data = self.missiles.get(missile_id)
+        if missile_data is None:
+            return
+
+        guidance_duration = 120.0  # 120 saniye max guidance
+        start_time = time.time()
+        missile_speed = 40.0  # m/s (144 km/h)
+        guidance_interval = 0.2  # 200ms güncelleme
+
+        collision_threshold = 5.0  # 5 metre içinde vuruş sayılır
+
+        try:
+            while missile_data['status'] == 'active':
+                elapsed = time.time() - start_time
+
+                # Max guidance süresi aşıldıysa veya hedef kaybolduysa
+                if elapsed > guidance_duration:
+                    missile_data['status'] = 'timeout'
+                    print(f"⏱️ MISSILE {missile_id} TIMEOUT (no guidance for {guidance_duration}s)")
+                    break
+
+                # Hedef konumunu al
+                if target_id == 6 and self.enemy_vehicle:
+                    target = self.enemy_vehicle
+                elif target_id == 1:
+                    target = self.vehicle
+                else:
+                    target = self.slave_vehicles.get(target_id)
+
+                if target is None or not self._has_valid_position(target):
+                    missile_data['status'] = 'target_lost'
+                    print(f"❌ MISSILE {missile_id} TARGET LOST")
+                    break
+
+                target_loc = target.location.global_relative_frame
+
+                # Füze konumunu güncelle (launcher'dan başlayıp hedef yönü doğru hareket)
+                current_pos = missile_data['position']
+                
+                # Launcher'dan hedefe doğru birim vektörü hesapla
+                d_lat = (target_loc.lat - current_pos['lat']) * 111111.0
+                d_lon = (target_loc.lon - current_pos['lon']) * 111111.0 * max(math.cos(math.radians(target_loc.lat)), 1e-6)
+                d_alt = target_loc.alt - current_pos['alt']
+
+                distance_3d = math.sqrt(d_lat**2 + d_lon**2 + d_alt**2)
+
+                if distance_3d < collision_threshold:
+                    # VURUŞ!
+                    missile_data['status'] = 'impact'
+                    print(f"\n💥 MISSILE {missile_id} IMPACT!")
+                    print(f"   Distance to target: {distance_3d:.2f}m")
+                    print(f"   Impact location: ({target_loc.lat:.6f}, {target_loc.lon:.6f}, {target_loc.alt:.1f}m)")
+                    self._handle_missile_impact(missile_id, target_id, target_loc)
+                    break
+
+                # Normalize ve hareket et
+                if distance_3d > 0.1:
+                    step_size = min(missile_speed * guidance_interval, distance_3d)
+                    move_lat = (d_lat / distance_3d) * step_size / 111111.0
+                    move_lon = (d_lon / distance_3d) * step_size / (111111.0 * max(math.cos(math.radians(target_loc.lat)), 1e-6))
+                    move_alt = (d_alt / distance_3d) * step_size
+
+                    missile_data['position']['lat'] += move_lat
+                    missile_data['position']['lon'] += move_lon
+                    missile_data['position']['alt'] += move_alt
+
+                    # Başlangıcı kontrol et (yerde dokunmuşsa, çarpışma)
+                    if missile_data['position']['alt'] < 0.5 and elapsed > 2.0:
+                        missile_data['status'] = 'ground_impact'
+                        print(f"\n💥 MISSILE {missile_id} HIT GROUND!")
+                        break
+
+                print(
+                    f"[MISSILE {missile_id}] Distance: {distance_3d:.1f}m | "
+                    f"Pos: ({missile_data['position']['lat']:.6f}, {missile_data['position']['lon']:.6f}, "
+                    f"{missile_data['position']['alt']:.1f}m)",
+                    end='\r'
+                )
+
+                time.sleep(guidance_interval)
+
+        except Exception as exc:
+            print(f"❌ Missile {missile_id} guidance error: {exc}")
+            missile_data['status'] = 'error'
+        finally:
+            print(f"\n✅ MISSILE {missile_id} GUIDANCE ENDED (Status: {missile_data.get('status', 'unknown')})")
+
+    def _handle_missile_impact(self, missile_id, target_id, impact_loc):
+        """
+        Füze vuruş olayını işle:
+        - Hedef araçta hasarı simüle et (hız/mod değişikliği)
+        - Gazebo'da düşüş sim etkinleştir
+        """
+        print(f"\n🔥 HANDLING IMPACT FOR MISSILE {missile_id} ON VEHICLE {target_id}")
+
+        # Hedef araçı al
+        if target_id == 6 and self.enemy_vehicle:
+            target = self.enemy_vehicle
+        elif target_id == 1:
+            target = self.vehicle
+        else:
+            target = self.slave_vehicles.get(target_id)
+
+        if target is None:
+            print(f"❌ Impact target {target_id} not found")
+            return
+
+        try:
+            # Hedefi GUIDED mode'e al (havada kontrol haber)
+            if target.mode.name != "GUIDED":
+                target.mode = VehicleMode("GUIDED")
+                time.sleep(0.5)
+
+            # Hızı düşür ve kontrol kaybettir (crash simulation)
+            target.airspeed = 5.0  # Düşük hız
+            print(f"   [HIT] {target_id} airspeed reduced to 5 m/s (damage simulation)")
+
+            # Alternatif: LAND moduna geç
+            time.sleep(1.0)
+            target.mode = VehicleMode("LAND")
+            print(f"   [HIT] {target_id} entered LAND mode (emergency landing)")
+
+        except Exception as exc:
+            print(f"   ⚠️ Impact handling error: {exc}")
+
+        # Gazebo'da füzeyisilme al (opsiyonel)
+        try:
+            subprocess.run(["gz", "model", "remove", "-m", f"missile_{missile_id}"], timeout=2)
+        except Exception:
+            pass
+
     def _calculate_distance(self, lat1, lon1, lat2, lon2):
         """İki GPS noktası arasındaki mesafeyi metre cinsinden hesapla (Haversine)."""
         earth_radius = 6378137.0
@@ -1224,6 +1442,34 @@ def main():
                         master.fire_missile(vehicle_id, hardpoint)
                     else:
                         print("Usage: fire <vehicle> <hardpoint>")
+                elif cmd.startswith("launch_missile"):
+                    parts = cmd.split()
+                    # launch_missile [launcher_id] [target_id]
+                    # Default: launcher=2 (UAV2), target=6 (Enemy/UAV6)
+                    try:
+                        launcher_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2
+                        target_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 6
+                        if master.launch_missile_at_target(launcher_id, target_id):
+                            print(f"✅ Missile launched from UAV{launcher_id} targeting UAV{target_id}")
+                        else:
+                            print(f"❌ Missile launch failed")
+                    except (ValueError, IndexError) as exc:
+                        print(f"❌ Usage: launch_missile [launcher_id] [target_id]")
+                        print(f"   Example: launch_missile 2 6 (UAV2 shoots UAV6)")
+                        print(f"   Defaults: launcher=2, target=6")
+                elif cmd == "missile status":
+                    if master.missiles:
+                        print("\n📊 MISSILE STATUS:")
+                        for missile_id, data in master.missiles.items():
+                            print(f"   Missile {missile_id}:")
+                            print(f"      Status: {data['status']}")
+                            print(f"      Launcher: UAV{data['launcher_id']}")
+                            print(f"      Target: UAV{data['target_id']}")
+                            print(f"      Position: ({data['position']['lat']:.6f}, {data['position']['lon']:.6f}, {data['position']['alt']:.1f}m)")
+                            elapsed = time.time() - data['launch_time']
+                            print(f"      Time: {elapsed:.1f}s")
+                    else:
+                        print("❌ No active missiles")
                 elif cmd:
                     print("Bilinmeyen komut")
 
