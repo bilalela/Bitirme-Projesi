@@ -886,6 +886,18 @@ class SwarmMaster:
             print(f"❌ Launcher vehicle {launcher_vehicle_id} bulunamadı")
             return False
 
+        # If target is 6 (Enemy) and not connected, try to connect first
+        if target is None and target_vehicle_id == 6:
+            print(f"⚠️ Enemy vehicle not connected, attempting to connect...")
+            try:
+                self.add_enemy(self.enemy_connection_string)
+                target = self.enemy_vehicle
+                if target:
+                    print(f"✅ Enemy vehicle connected successfully")
+            except Exception as exc:
+                print(f"❌ Failed to connect enemy vehicle: {exc}")
+                return False
+
         if target is None:
             print(f"❌ Target vehicle {target_vehicle_id} bulunamadı")
             return False
