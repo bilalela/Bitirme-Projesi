@@ -147,6 +147,18 @@
 
 
   <!-- Missiles removed: missile models and includes deleted per user request -->
+  <!-- Auto-included user-added models: radar and SAM launcher -->
+  <include>
+    <name>radar_simple</name>
+    <pose>10 0 0 0 0 0</pose>
+    <uri>model://radar_simple</uri>
+  </include>
+
+  <include>
+    <name>sam_launcher</name>
+    <pose>12 5 0 0 0 0</pose>
+    <uri>model://sam_launcher</uri>
+  </include>
 
   </world>
 </sdf>
