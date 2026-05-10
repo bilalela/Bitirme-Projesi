@@ -200,6 +200,37 @@
         </material>
       </visual>
 
+      <!-- Visual-only missiles attached under left and right wings -->
+      <visual name="missile_left_visual">
+        <pose degrees="true">-0.12 0.30 -0.03 0 90 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.5</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.12 0.18 0.08 1</ambient>
+          <diffuse>0.18 0.28 0.12 1</diffuse>
+          <specular>0.05 0.05 0.05 1</specular>
+        </material>
+      </visual>
+
+      <visual name="missile_right_visual">
+        <pose degrees="true">-0.12 -0.30 -0.03 0 90 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.5</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.12 0.18 0.08 1</ambient>
+          <diffuse>0.18 0.28 0.12 1</diffuse>
+          <specular>0.05 0.05 0.05 1</specular>
+        </material>
+      </visual>
+
       <visual name="left_tail_visual">
         <pose degrees="true">0 0 0 0 0 0</pose>
         <geometry>
