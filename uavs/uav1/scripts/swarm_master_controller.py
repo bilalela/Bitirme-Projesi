@@ -137,6 +137,8 @@ class SwarmMaster:
         # Missile system
         self.missiles = {}  # missile_id -> {'status', 'position', 'spawned_model_name', 'target_vehicle_id'}
         self.missile_counter = 0
+        self.auto_launch_missiles = True  # YOLO tespit -> otomatik füze atışı
+        self.missile_launched = False  # Track: sadece bir kez ateşle
 
     def connect(self):
         """Master araca baglan."""
@@ -756,12 +758,14 @@ class SwarmMaster:
         self._set_guided(slave2)
         print("🎯 Slave 2 enemy tracking başlatıldı (10m takip, plane-friendly)")
         self.enemy_tracking_active = True
+        self.missile_launched = False  # Reset missile launch flag for this tracking session
 
         try:
             target_distance = 10.0
             # Distance error is in meters, so gain must stay small.
             k_p = 0.08
             tracking_count = 0
+            auto_launch_attempted = False  # Ensure missile only launched once per tracking
 
             while self.enemy_tracking_active:
                 if not self._has_valid_position(self.enemy_vehicle) or not self._has_valid_position(slave2):
@@ -847,6 +851,17 @@ class SwarmMaster:
                         f"Distance | Enemy Speed | Slave2 Target Speed -> "
                         f"{current_distance:.1f}m | {enemy_speed:.1f} m/s | {desired_speed:.1f} m/s"
                     )
+                
+                # Auto-launch missile on first YOLO detection with high confidence
+                if self.auto_launch_missiles and not auto_launch_attempted:
+                    confidence = self.target_data.get('confidence', 0) if self.target_data else 0
+                    if confidence > 0.60:  # 60% confidence threshold
+                        print(f"\n🚀 AUTO-LAUNCH TRIGGERED: YOLO confidence {confidence:.2f} > 0.60")
+                        if self.launch_missile_at_target(launcher_vehicle_id=2, target_vehicle_id=6):
+                            auto_launch_attempted = True
+                            print(f"✅ Missile auto-launched from UAV2 targeting UAV6\n")
+                        else:
+                            print(f"❌ Auto-launch failed, manual launch still available\n")
 
                 time.sleep(0.5)
 
@@ -1094,6 +1109,18 @@ class SwarmMaster:
             return
         
         self._tasks_assigned = True
+        
+        # Auto-launch missile if high confidence target detected
+        if self.auto_launch_missiles and not self.missile_launched and self.target_data:
+            confidence = self.target_data.get('confidence', 0)
+            if confidence > 0.60:  # 60% confidence threshold
+                print(f"\n🚀 AUTO-LAUNCH TRIGGERED: YOLO confidence {confidence:.2f} > 0.60")
+                if self.launch_missile_at_target(launcher_vehicle_id=2, target_vehicle_id=6):
+                    self.missile_launched = True
+                    print(f"✅ Missile auto-launched from UAV2 targeting UAV6\n")
+                else:
+                    print(f"❌ Auto-launch failed, manual launch still available\n")
+        
         for slave_id, slave in self.slave_vehicles.items():
             task = self.slave_tasks.get(slave_id, "FORMATION_HOLD")
             target_lat = self.target_data['lat'] if self.target_data and 'lat' in self.target_data else 0.0
@@ -1470,6 +1497,17 @@ def main():
                             print(f"      Time: {elapsed:.1f}s")
                     else:
                         print("❌ No active missiles")
+                elif cmd == "auto_launch on":
+                    master.auto_launch_missiles = True
+                    master.missile_launched = False
+                    print("✅ Auto-launch ENABLED - missiles will fire on YOLO detection (conf > 0.60)")
+                elif cmd == "auto_launch off":
+                    master.auto_launch_missiles = False
+                    print("✅ Auto-launch DISABLED - manual launch only")
+                elif cmd == "auto_launch status":
+                    status = "ENABLED ✅" if master.auto_launch_missiles else "DISABLED ❌"
+                    print(f"Auto-launch: {status}")
+                    print(f"Missile already launched this session: {master.missile_launched}")
                 elif cmd:
                     print("Bilinmeyen komut")
 
